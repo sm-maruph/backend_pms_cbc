@@ -9,6 +9,7 @@ const ticketRoutes = require('./routes/ticketRoutes');
 const statsRoutes = require('./routes/statsRoutes');
 const reportRoutes = require('./routes/reportRoutes');
 const userRoutes = require('./routes/userRoutes');
+const staticRoutes = require('./routes/staticRoutes');
 
 const { poolPromise } = require('./config/db');
 
@@ -27,6 +28,7 @@ app.use('/api/tickets', ticketRoutes);
 app.use('/api/stats', statsRoutes);
 app.use('/api/reports', reportRoutes);
 app.use('/api/users', userRoutes);
+app.use('/api/static', staticRoutes);
 
 app.get('/api/health', (req, res) => res.json({ status: 'OK', timestamp: new Date() }));
 
