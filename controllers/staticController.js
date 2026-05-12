@@ -8,9 +8,8 @@ const { poolPromise, sql } = require('../config/db');
 exports.getSystems = async (req, res) => {
     try {
         const pool = await poolPromise;
-        const result = await pool.request().query('SELECT name FROM Systems ORDER BY name');
-        const systems = result.recordset.map(row => row.name);
-        res.json(systems);
+        const result = await pool.request().query('SELECT id, name FROM Systems ORDER BY name');
+        res.json(result.recordset);
     } catch (err) {
         console.error('Error fetching systems:', err);
         res.status(500).json({ message: 'Error fetching systems', error: err.message });
@@ -95,9 +94,8 @@ exports.deleteSystem = async (req, res) => {
 exports.getDepartments = async (req, res) => {
     try {
         const pool = await poolPromise;
-        const result = await pool.request().query('SELECT name FROM Departments ORDER BY name');
-        const departments = result.recordset.map(row => row.name);
-        res.json(departments);
+        const result = await pool.request().query('SELECT id, name FROM Departments ORDER BY name');
+        res.json(result.recordset);
     } catch (err) {
         console.error('Error fetching departments:', err);
         res.status(500).json({ message: 'Error fetching departments', error: err.message });
@@ -182,9 +180,8 @@ exports.deleteDepartment = async (req, res) => {
 exports.getBranches = async (req, res) => {
     try {
         const pool = await poolPromise;
-        const result = await pool.request().query('SELECT name FROM Branches ORDER BY name');
-        const branches = result.recordset.map(row => row.name);
-        res.json(branches);
+        const result = await pool.request().query('SELECT id, name FROM Branches ORDER BY name');
+        res.json(result.recordset);
     } catch (err) {
         console.error('Error fetching branches:', err);
         res.status(500).json({ message: 'Error fetching branches', error: err.message });
