@@ -87,17 +87,51 @@ exports.createTicket = async (req, res) => {
     try {
         const pool = await poolPromise;
 
+        // Convert downTime to SQL compatible format
+        let formattedDownTime = null;
+        if (downTime) {
+            try {
+                // Try to parse the date string
+                const parsedDate = new Date(downTime);
+                if (!isNaN(parsedDate.getTime())) {
+                    formattedDownTime = parsedDate;
+                } else {
+                    formattedDownTime = new Date();
+                }
+            } catch (e) {
+                formattedDownTime = new Date();
+            }
+        }
+
         // Generate ticket_sl
+        console.log("📝 Generating ticket_sl...");
         const ticketSLResult = await pool.request()
-            .input('date', sql.Date, date || new Date())
-            .query(`...`); // Your existing ticket_sl generation code
+            .input('inputDate', sql.Date, date || new Date())
+            .query(`
+                DECLARE @date DATE = @inputDate;
+                DECLARE @day NVARCHAR(2) = RIGHT('0' + CAST(DAY(@date) AS NVARCHAR(2)), 2);
+                DECLARE @monthNum NVARCHAR(2) = RIGHT('0' + CAST(MONTH(@date) AS NVARCHAR(2)), 2);
+                DECLARE @year NVARCHAR(4) = CAST(YEAR(@date) AS NVARCHAR(4));
+                DECLARE @datePart NVARCHAR(8) = @day + @monthNum + @year;
+                DECLARE @sequence INT;
+                
+                SELECT @sequence = ISNULL(MAX(CAST(SUBSTRING(ticket_sl, CHARINDEX('-', ticket_sl) + 1, LEN(ticket_sl)) AS INT)), 0) + 1
+                FROM Tickets
+                WHERE ticket_sl IS NOT NULL AND ticket_sl LIKE @datePart + '-%';
+                
+                IF @sequence IS NULL SET @sequence = 1;
+                
+                SELECT @datePart + '-' + CAST(@sequence AS NVARCHAR(10)) AS ticket_sl;
+            `);
 
         const ticket_sl = ticketSLResult.recordset[0]?.ticket_sl;
+        console.log("✅ Generated ticket_sl:", ticket_sl);
 
         // Use values from frontend
         const finalAssignedToEmail = assignedToEmail || null;
         const finalAssignedToName = assignedToName || 'Unassigned';
 
+        console.log("📝 Inserting ticket...");
         await pool.request()
             .input('ticket_sl', sql.NVarChar, ticket_sl)
             .input('date', sql.Date, date || new Date())
@@ -109,9 +143,9 @@ exports.createTicket = async (req, res) => {
             .input('riskLabel', sql.NVarChar, riskLabel || 'MEDIUM')
             .input('affectedUser', sql.NVarChar, affectedUser)
             .input('assignedToEmail', sql.NVarChar, finalAssignedToEmail)
-            .input('assignedToName', sql.NVarChar, finalAssignedToName)  // ✅ Use from frontend
+            .input('assignedToName', sql.NVarChar, finalAssignedToName)
             .input('pcName', sql.NVarChar, pcName || null)
-            .input('downTime', sql.DateTime, downTime || new Date())
+            .input('downTime', sql.DateTime, formattedDownTime || new Date())
             .input('reportedByEmail', sql.NVarChar, reportedByEmail)
             .input('reporterName', sql.NVarChar, reporterName)
             .query(`
@@ -129,6 +163,8 @@ exports.createTicket = async (req, res) => {
                 )
             `);
 
+        console.log("✅ Ticket inserted successfully:", ticket_sl);
+
         res.status(201).json({
             message: 'Ticket created successfully',
             ticket_sl: ticket_sl,
@@ -136,13 +172,17 @@ exports.createTicket = async (req, res) => {
         });
 
     } catch (err) {
-        console.error('Error creating ticket:', err);
+        console.error('❌ Error creating ticket:', err);
+        console.error('❌ Error stack:', err.stack);
         res.status(500).json({ message: 'Error creating ticket', error: err.message });
     }
 };
 exports.updateTicket = async (req, res) => {
     const { id } = req.params;
     const updates = req.body;
+
+    console.log("📥 Update request for ticket:", id);
+    console.log("📦 Update data:", updates);
 
     // Update allowed fields to include new schema fields
     const allowed = [
@@ -159,8 +199,24 @@ exports.updateTicket = async (req, res) => {
 
     for (let field of allowed) {
         if (updates[field] !== undefined) {
-            setClause.push(`${field} = @${field}`);
-            request.input(field, sql.NVarChar, updates[field]);
+            // Handle date fields specially
+            if (field === 'up_time' || field === 'down_time') {
+                let dateValue = updates[field];
+                if (dateValue) {
+                    // Try to convert to valid Date object
+                    const parsedDate = new Date(dateValue);
+                    if (!isNaN(parsedDate.getTime())) {
+                        dateValue = parsedDate;
+                    } else {
+                        dateValue = null;
+                    }
+                }
+                setClause.push(`${field} = @${field}`);
+                request.input(field, sql.DateTime, dateValue || null);
+            } else {
+                setClause.push(`${field} = @${field}`);
+                request.input(field, sql.NVarChar, updates[field]);
+            }
         }
     }
 
@@ -176,9 +232,12 @@ exports.updateTicket = async (req, res) => {
         }
     }
 
+    // Handle resolved status with proper date
     if (updates.status === 'resolved' && !updates.up_time) {
-        request.input('up_time', sql.DateTime, new Date());
+        const now = new Date();
+        request.input('up_time', sql.DateTime, now);
         setClause.push('up_time = @up_time');
+        console.log("🕐 Setting up_time to:", now);
     }
 
     if (setClause.length === 0) {
@@ -188,7 +247,9 @@ exports.updateTicket = async (req, res) => {
     setClause.push('updated_at = GETDATE()');
 
     try {
-        await request.query(`UPDATE Tickets SET ${setClause.join(', ')} WHERE id = @id`);
+        const query = `UPDATE Tickets SET ${setClause.join(', ')} WHERE id = @id`;
+        console.log("📝 Update query:", query);
+        await request.query(query);
         res.json({ message: 'Ticket updated successfully' });
     } catch (err) {
         console.error('Update error:', err);

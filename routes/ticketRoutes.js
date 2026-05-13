@@ -23,7 +23,16 @@ router.get('/my', getMyTickets);
 router.get('/sl/:ticket_sl', getTicketBySL);
 
 // Create new ticket
-router.post('/', validateTicket, createTicket);
+// Add debug logging for POST
+router.post('/', (req, res, next) => {
+    console.log("🔵 POST /api/tickets - Request received");
+    console.log("🔵 Headers:", req.headers);
+    console.log("🔵 Body:", req.body);
+    next();
+}, validateTicket, (req, res, next) => {
+    console.log("🟢 Validation passed");
+    next();
+}, createTicket);
 
 // Update ticket by ID
 router.put('/:id', updateTicket);

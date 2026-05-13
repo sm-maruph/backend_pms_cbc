@@ -17,24 +17,34 @@ const validateTicket = [
     body('problemDetails').notEmpty().trim().withMessage('Problem details are required'),
 
     // Optional fields with validation when provided
-    body('systemName').optional().trim(),
-    body('department').optional().trim(),
-    body('branch').optional().trim(),
-    body('affectedUser').optional().trim(),
-    body('pcName').optional().trim(),
-    body('assignedToEmail').optional().isEmail().withMessage('Invalid email format for assignment'),
-    body('assignedToName').optional().trim(),  // ✅ ADD THIS - important!
+    body('systemName').optional({ nullable: true, checkFalsy: true }).trim(),
+    body('department').optional({ nullable: true, checkFalsy: true }).trim(),
+    body('branch').optional({ nullable: true, checkFalsy: true }).trim(),
+    body('affectedUser').optional({ nullable: true, checkFalsy: true }).trim(),
+    body('pcName').optional({ nullable: true, checkFalsy: true }).trim(),
+    
+    // Allow null, empty string, or valid email
+    body('assignedToEmail')
+        .optional({ nullable: true, checkFalsy: true })
+        .custom(value => {
+            if (!value || value === null || value === '') return true;
+            return /^\S+@\S+\.\S+$/.test(value);
+        })
+        .withMessage('Invalid email format for assignment'),
+    
+    body('assignedToName').optional({ nullable: true, checkFalsy: true }).trim(),
 
-    // Risk label with default (not required in request, will default to MEDIUM)
-    body('riskLabel').optional().isIn(['LOW', 'MEDIUM', 'HIGH']).withMessage('Risk label must be LOW, MEDIUM, or HIGH'),
+    // Risk label with default
+    body('riskLabel').optional({ nullable: true }).isIn(['LOW', 'MEDIUM', 'HIGH']).withMessage('Risk label must be LOW, MEDIUM, or HIGH'),
 
-    // Date fields (optional, will default to current date/time)
-    body('date').optional().isISO8601().withMessage('Invalid date format'),
-    body('downTime').optional(), // ✅ REMOVED ISO validation - now accepts any format
+    // Date fields
+    body('date').optional({ nullable: true }).isISO8601().withMessage('Invalid date format'),
+    body('downTime').optional({ nullable: true }), // No ISO validation
 
     (req, res, next) => {
         const errors = validationResult(req);
         if (!errors.isEmpty()) {
+            console.log("❌ Validation errors:", JSON.stringify(errors.array(), null, 2));
             return res.status(400).json({ errors: errors.array() });
         }
         next();
