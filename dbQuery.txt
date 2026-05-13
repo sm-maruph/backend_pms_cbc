@@ -1,0 +1,36 @@
+USE master;
+GO
+
+-- Drop existing login (if any)
+IF EXISTS (SELECT 1 FROM sys.sql_logins WHERE name = 'app_user')
+    DROP LOGIN app_user;
+GO
+
+-- Create login with explicit default database
+CREATE LOGIN app_user WITH PASSWORD = 'Myheart@1315', 
+    DEFAULT_DATABASE = ProblemMgmt,
+    CHECK_POLICY = OFF;
+GO
+
+-- Enable the login (in case it's disabled)
+ALTER LOGIN app_user ENABLE;
+GO
+
+-- Give the login sysadmin role for testing (optional, remove later)
+-- EXEC sp_addsrvrolemember 'app_user', 'sysadmin';
+-- Or just grant connect permission
+GRANT CONNECT SQL TO app_user;
+GO
+
+USE ProblemMgmt;
+GO
+
+-- Drop existing database user
+IF EXISTS (SELECT 1 FROM sys.database_principals WHERE name = 'app_user')
+    DROP USER app_user;
+GO
+
+-- Create database user and grant db_owner
+CREATE USER app_user FOR LOGIN app_user;
+ALTER ROLE db_owner ADD MEMBER app_user;
+GO
