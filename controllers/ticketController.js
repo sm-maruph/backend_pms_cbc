@@ -1,4 +1,13 @@
 const { poolPromise, sql } = require('../config/db');
+const { saveNotification } = require('./notificationController');
+
+// Helper to get ALL users (both admin and regular users)
+async function getAllUsers() {
+    const pool = await poolPromise;
+    const result = await pool.request().query("SELECT email, name, role FROM Users");
+    return result.recordset;
+}
+
 
 exports.getAllTickets = async (req, res) => {
     try {
@@ -165,6 +174,78 @@ exports.createTicket = async (req, res) => {
 
         console.log("✅ Ticket inserted successfully:", ticket_sl);
 
+        // ============================================================
+        // 🔔 SEND NOTIFICATIONS TO ALL USERS (ADMINS + REGULAR USERS)
+        // ============================================================
+
+        // Helper function to get ALL users
+        const getAllUsers = async () => {
+            const result = await pool.request().query("SELECT email, name, role FROM Users");
+            return result.recordset;
+        };
+
+        // Helper function to save notification (import from notificationController)
+        const saveNotification = async (userEmail, notification, ticket_sl = null, metadata = null) => {
+            try {
+                await pool.request()
+                    .input('user_email', sql.NVarChar, userEmail)
+                    .input('type', sql.NVarChar, notification.type)
+                    .input('title', sql.NVarChar, notification.title)
+                    .input('message', sql.NVarChar, notification.message)
+                    .input('ticket_sl', sql.NVarChar, ticket_sl)
+                    .input('metadata', sql.NVarChar, metadata ? JSON.stringify(metadata) : null)
+                    .query(`
+                INSERT INTO Notifications (user_email, type, title, message, ticket_sl, metadata, created_at)
+                VALUES (@user_email, @type, @title, @message, @ticket_sl, @metadata, GETDATE())
+            `);
+                return true;
+            } catch (err) {
+                console.error('Failed to save notification:', err);
+                return false;
+            }
+        };
+
+        // Get ALL users from the system
+        const allUsers = await getAllUsers();
+        console.log(`📢 Sending notifications to ${allUsers.length} users...`);
+
+        // Create notification message
+        const riskEmoji = riskLabel === 'HIGH' ? '🔴' : riskLabel === 'MEDIUM' ? '🟡' : '🟢';
+        const notification = {
+            type: 'new_ticket',
+            title: '📢 New Ticket Created',
+            message: `${reporterName} created ticket ${ticket_sl}: ${systemName} ${riskEmoji}`,
+        };
+
+        const io = req.app.get('io');
+        const connectedUsers = req.app.get('connectedUsers');
+
+        // Send notification to EVERY user in the system
+        for (const user of allUsers) {
+            // Skip sending to the ticket creator? (Optional - remove if you want creator to also get notification)
+            if (user.email === reportedByEmail) continue;
+
+            // Save to database for each user
+            await saveNotification(user.email, notification, ticket_sl);
+
+            // Send real-time if user is connected
+            const socketId = connectedUsers?.get(user.email);
+            if (socketId && io) {
+                io.to(socketId).emit('notification', {
+                    ...notification,
+                    id: ticket_sl,
+                    created_at: new Date().toISOString(),
+                    is_read: 0
+                });
+                console.log(`✅ Real-time notification sent to ${user.email} (${user.role})`);
+            } else {
+                console.log(`⏸️ User ${user.email} (${user.role}) is offline - notification saved to DB`);
+            }
+        }
+
+        console.log(`✅ Notifications sent to all ${allUsers.length} users`);
+        console.log("✅ Ticket creation completed successfully!");
+
         res.status(201).json({
             message: 'Ticket created successfully',
             ticket_sl: ticket_sl,
@@ -177,6 +258,8 @@ exports.createTicket = async (req, res) => {
         res.status(500).json({ message: 'Error creating ticket', error: err.message });
     }
 };
+
+
 exports.updateTicket = async (req, res) => {
     const { id } = req.params;
     const updates = req.body;
