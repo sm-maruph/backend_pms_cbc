@@ -380,3 +380,409 @@ exports.getTicketBySL = async (req, res) => {
         res.status(500).json({ message: 'Error fetching ticket' });
     }
 };
+
+// Open: backend/controllers/ticketController.js
+// Add this function at the end of the file (before module.exports)
+
+// ============================================
+// VALIDATE BULK TICKETS (Check before import)
+// ============================================
+exports.validateBulkTickets = async (req, res) => {
+    console.log("🔍 ========== VALIDATE BULK TICKETS ==========");
+
+    const tickets = req.body;
+    const validationResults = {
+        valid: [],
+        invalid: [],
+        summary: {
+            total: tickets.length,
+            validCount: 0,
+            invalidCount: 0,
+            missingEmails: [],
+            missingRequiredFields: []
+        }
+    };
+
+    const requiredFields = ['system_name', 'problem_details', 'department', 'branch', 'reported_by_email', 'reporter_name'];
+
+    for (let i = 0; i < tickets.length; i++) {
+        const ticket = tickets[i];
+        const errors = [];
+
+        const isEmpty = (value) => {
+            return value === undefined || value === null || value === '' ||
+                String(value).trim() === '' || String(value).trim() === 'NaN';
+        };
+
+        for (const field of requiredFields) {
+            if (isEmpty(ticket[field])) {
+                errors.push(`${field} is required`);
+                if (field === 'reported_by_email') {
+                    validationResults.summary.missingEmails.push(ticket.reporter_name || `row_${i + 1}`);
+                }
+            }
+        }
+
+        if (errors.length > 0) {
+            validationResults.invalid.push({
+                row: i + 1,
+                ticket_sl: ticket.ticket_sl || 'N/A',
+                reporter: ticket.reporter_name || 'Unknown',
+                errors: errors
+            });
+            validationResults.summary.invalidCount++;
+        } else {
+            validationResults.valid.push({
+                row: i + 1,
+                ticket_sl: ticket.ticket_sl || 'will be auto-generated',
+                reporter: ticket.reporter_name,
+                system: ticket.system_name
+            });
+            validationResults.summary.validCount++;
+        }
+    }
+
+    validationResults.summary.missingEmails = [...new Set(validationResults.summary.missingEmails)];
+
+    res.status(200).json(validationResults);
+};
+
+// ============================================
+// BULK IMPORT TICKETS (Actual import)
+// ============================================
+// ============================================
+// BULK IMPORT TICKETS (Updated - Fetches emails from Users table)
+// ============================================
+exports.bulkImportTickets = async (req, res) => {
+    console.log("📥 ========== BULK IMPORT TICKETS REQUEST ==========");
+    console.log("📦 Number of tickets:", req.body.length);
+    console.log("👤 User from token:", req.user);
+
+    const tickets = req.body;
+    const results = {
+        successful: [],
+        failed: [],
+        total: tickets.length
+    };
+
+    const pool = await poolPromise;
+
+    // Get the logged-in user's info (admin doing the import)
+    const adminEmail = req.user.email;
+    const adminName = req.user.name;
+
+    // Helper function to handle empty values - returns NULL for database
+    const handleEmptyValue = (value) => {
+        if (value === undefined || value === null || value === '') {
+            return null;
+        }
+        const stringValue = String(value).trim();
+        if (stringValue === '' || stringValue === 'NaN' || stringValue === 'null' || stringValue === 'undefined') {
+            return null;
+        }
+        return stringValue;
+    };
+
+    // Helper function for string fields - returns default instead of NULL
+    const handleStringField = (value, defaultValue) => {
+        if (value === undefined || value === null || value === '') {
+            return defaultValue;
+        }
+        const stringValue = String(value).trim();
+        if (stringValue === '' || stringValue === 'NaN' || stringValue === 'null' || stringValue === 'undefined') {
+            return defaultValue;
+        }
+        return stringValue;
+    };
+
+    // Helper function to get email from Users table by name
+    const getUserEmailByName = async (name, pool) => {
+        if (!name || name === 'Unassigned' || name === 'Not Mentioned') {
+            return null;
+        }
+        try {
+            const result = await pool.request()
+                .input('name', sql.NVarChar, name)
+                .query('SELECT email FROM Users WHERE name = @name');
+
+            if (result.recordset.length > 0) {
+                return result.recordset[0].email;
+            }
+            console.log(`⚠️ User not found: ${name}`);
+            return null;
+        } catch (err) {
+            console.error(`❌ Error fetching email for ${name}:`, err.message);
+            return null;
+        }
+    };
+
+    // Helper function to validate and get ID from static tables
+    const getStaticItemId = async (pool, tableName, columnName, value) => {
+        if (!value || value === 'Not Specified') return null;
+
+        try {
+            const result = await pool.request()
+                .input('name', sql.NVarChar, value)
+                .query(`SELECT id FROM ${tableName} WHERE ${columnName} = @name`);
+
+            if (result.recordset.length > 0) {
+                return result.recordset[0].id;
+            }
+            return null;
+        } catch (err) {
+            console.error(`❌ Error checking ${tableName}:`, err.message);
+            return null;
+        }
+    };
+
+    for (let i = 0; i < tickets.length; i++) {
+        const ticket = tickets[i];
+
+        try {
+            console.log(`\n📝 Processing ticket ${i + 1}/${tickets.length}:`, ticket.ticket_sl || `row_${i + 1}`);
+
+            // Extract values with proper handling
+            const providedTicketSl = handleEmptyValue(ticket.ticket_sl);
+            const date = handleEmptyValue(ticket.date);
+            const month = handleEmptyValue(ticket.month);
+            const affected_user = handleStringField(ticket.affected_user, 'Not Mentioned');
+            const assigned_to_name = handleStringField(ticket.assigned_to_name, 'Unassigned');
+            const assigned_to_email_raw = handleEmptyValue(ticket.assigned_to_email);
+            const system_name = handleStringField(ticket.system_name, 'Not Specified');
+            const problem_details = handleStringField(ticket.problem_details, 'No details provided');
+            const department = handleStringField(ticket.department, 'Not Specified');
+            const branch = handleStringField(ticket.branch, 'Not Specified');
+            const risk_label = handleStringField(ticket.risk_label, 'MEDIUM');
+            const pc_name = handleStringField(ticket.pc_name, 'Not Mentioned');
+            const down_time = handleEmptyValue(ticket.down_time);
+            const up_time = handleEmptyValue(ticket.up_time);
+            const resolution = handleEmptyValue(ticket.resolution);
+            const root_cause = handleEmptyValue(ticket.root_cause);
+            const remarks = handleEmptyValue(ticket.remarks);
+            const remarks_by_admin = handleEmptyValue(ticket.remarks_by_admin);
+            const special_instruction = handleEmptyValue(ticket.special_instruction);
+            const status_from_excel = handleStringField(ticket.status, 'pending');
+            const reporter_name_from_excel = handleStringField(ticket.reporter_name, null);
+
+            // 🔍 FETCH reported_by_email from Users table by matching reporter_name
+            let reported_by_email = null;
+            let reporter_name = null;
+
+            if (reporter_name_from_excel) {
+                // Try to find user by name
+                const userResult = await pool.request()
+                    .input('name', sql.NVarChar, reporter_name_from_excel)
+                    .query('SELECT email, name FROM Users WHERE name = @name');
+
+                if (userResult.recordset.length > 0) {
+                    reported_by_email = userResult.recordset[0].email;
+                    reporter_name = userResult.recordset[0].name;
+                    console.log(`✅ Found reporter: ${reporter_name} (${reported_by_email})`);
+                } else {
+                    console.log(`⚠️ Reporter not found in Users table: ${reporter_name_from_excel}`);
+                    // Use admin as fallback for bulk import
+                    reported_by_email = adminEmail;
+                    reporter_name = adminName;
+                }
+            } else {
+                // If no reporter name provided, use admin
+                reported_by_email = adminEmail;
+                reporter_name = adminName;
+            }
+
+            // 🔍 FETCH assigned_to_email from Users table by matching assigned_to_name
+            let assigned_to_email = assigned_to_email_raw;
+            if (!assigned_to_email && assigned_to_name && assigned_to_name !== 'Unassigned') {
+                assigned_to_email = await getUserEmailByName(assigned_to_name, pool);
+                if (assigned_to_email) {
+                    console.log(`✅ Found assignee: ${assigned_to_name} (${assigned_to_email})`);
+                }
+            }
+
+            // Validate required fields (only problem_details is truly required)
+            const missingFields = [];
+            if (!problem_details || problem_details === 'No details provided') {
+                missingFields.push('problem_details');
+            }
+
+            if (missingFields.length > 0) {
+                results.failed.push({
+                    ticket_sl: providedTicketSl || `row_${i + 1}`,
+                    reporter: reporter_name,
+                    error: `Missing required fields: ${missingFields.join(', ')}`
+                });
+                continue;
+            }
+
+            // Generate ticket_sl if not provided
+            let finalTicketSl = providedTicketSl;
+            if (!finalTicketSl && date) {
+                try {
+                    const dateObj = new Date(date);
+                    if (!isNaN(dateObj.getTime())) {
+                        const day = String(dateObj.getDate()).padStart(2, '0');
+                        const monthNum = String(dateObj.getMonth() + 1).padStart(2, '0');
+                        const year = dateObj.getFullYear();
+                        const datePart = `${day}${monthNum}${year}`;
+
+                        const sequenceResult = await pool.request()
+                            .input('datePart', sql.NVarChar, datePart)
+                            .query(`
+                                SELECT ISNULL(MAX(CAST(SUBSTRING(ticket_sl, CHARINDEX('-', ticket_sl) + 1, LEN(ticket_sl)) AS INT)), 0) + 1 AS seq
+                                FROM Tickets
+                                WHERE ticket_sl LIKE @datePart + '-%'
+                            `);
+                        const sequence = sequenceResult.recordset[0]?.seq || 1;
+                        finalTicketSl = `${datePart}-${sequence}`;
+                    } else {
+                        finalTicketSl = `IMP-${Date.now()}-${i + 1}`;
+                    }
+                } catch (e) {
+                    finalTicketSl = `IMP-${Date.now()}-${i + 1}`;
+                }
+            } else if (!finalTicketSl) {
+                finalTicketSl = `IMP-${Date.now()}-${i + 1}`;
+            }
+
+            // Format dates
+            let formattedDate = null;
+            let formattedDownTime = null;
+            let formattedUpTime = null;
+
+            if (date) {
+                try {
+                    formattedDate = new Date(date);
+                    if (isNaN(formattedDate.getTime())) formattedDate = null;
+                } catch (e) {
+                    formattedDate = null;
+                }
+            }
+
+            if (down_time) {
+                try {
+                    formattedDownTime = new Date(down_time);
+                    if (isNaN(formattedDownTime.getTime())) formattedDownTime = null;
+                } catch (e) {
+                    formattedDownTime = null;
+                }
+            }
+
+            if (up_time) {
+                try {
+                    formattedUpTime = new Date(up_time);
+                    if (isNaN(formattedUpTime.getTime())) formattedUpTime = null;
+                } catch (e) {
+                    formattedUpTime = null;
+                }
+            }
+
+            // Determine status
+            let finalStatus = status_from_excel.toLowerCase();
+            if (finalStatus === 'pending' || finalStatus === 'open') {
+                if (resolution && (resolution.toLowerCase() === 'solved' || resolution.toLowerCase() === 'resolved')) {
+                    finalStatus = 'resolved';
+                } else if (resolution && resolution.toLowerCase() === 'it task') {
+                    finalStatus = 'in-progress';
+                }
+            }
+
+            const finalRiskLabel = risk_label.toUpperCase();
+
+            let finalMonth = month;
+            if (!finalMonth && formattedDate) {
+                finalMonth = formattedDate.toLocaleString('default', { month: 'long' });
+            }
+
+            // Optional: Validate that department, branch, system_name exist in static tables (optional - just log warning)
+            const deptExists = await getStaticItemId(pool, 'Departments', 'name', department);
+            const branchExists = await getStaticItemId(pool, 'Branches', 'name', branch);
+            const systemExists = await getStaticItemId(pool, 'Systems', 'name', system_name);
+
+            if (!deptExists && department !== 'Not Specified') {
+                console.log(`⚠️ Warning: Department '${department}' not found in Departments table`);
+            }
+            if (!branchExists && branch !== 'Not Specified') {
+                console.log(`⚠️ Warning: Branch '${branch}' not found in Branches table`);
+            }
+            if (!systemExists && system_name !== 'Not Specified') {
+                console.log(`⚠️ Warning: System '${system_name}' not found in Systems table`);
+            }
+
+            // Insert ticket
+            await pool.request()
+                .input('ticket_sl', sql.NVarChar, finalTicketSl)
+                .input('date', sql.Date, formattedDate)
+                .input('month', sql.NVarChar, finalMonth)
+                .input('system_name', sql.NVarChar, system_name)
+                .input('problem_details', sql.NVarChar, problem_details)
+                .input('department', sql.NVarChar, department)
+                .input('branch', sql.NVarChar, branch)
+                .input('risk_label', sql.NVarChar, finalRiskLabel)
+                .input('affected_user', sql.NVarChar, affected_user)
+                .input('assigned_to_email', sql.NVarChar, assigned_to_email)
+                .input('assigned_to_name', sql.NVarChar, assigned_to_name)
+                .input('pc_name', sql.NVarChar, pc_name)
+                .input('down_time', sql.DateTime, formattedDownTime)
+                .input('up_time', sql.DateTime, formattedUpTime)
+                .input('resolution', sql.NVarChar, resolution)
+                .input('root_cause', sql.NVarChar, root_cause)
+                .input('remarks', sql.NVarChar, remarks)
+                .input('remarks_by_admin', sql.NVarChar, remarks_by_admin)
+                .input('special_instruction', sql.NVarChar, special_instruction)
+                .input('reported_by_email', sql.NVarChar, reported_by_email)
+                .input('reporter_name', sql.NVarChar, reporter_name)
+                .input('status', sql.NVarChar, finalStatus)
+                .query(`
+                    INSERT INTO Tickets (
+                        ticket_sl, date, month, system_name, problem_details, 
+                        department, branch, risk_label, affected_user, 
+                        assigned_to_email, assigned_to_name, pc_name, down_time, up_time,
+                        resolution, root_cause, remarks, remarks_by_admin, special_instruction,
+                        reported_by_email, reporter_name, status, created_at, updated_at
+                    )
+                    VALUES (
+                        @ticket_sl, @date, @month, @system_name, @problem_details,
+                        @department, @branch, @risk_label, @affected_user,
+                        @assigned_to_email, @assigned_to_name, @pc_name, @down_time, @up_time,
+                        @resolution, @root_cause, @remarks, @remarks_by_admin, @special_instruction,
+                        @reported_by_email, @reporter_name, @status, GETDATE(), GETDATE()
+                    )
+                `);
+
+            results.successful.push({
+                ticket_sl: finalTicketSl,
+                reporter: reporter_name,
+                assignee: assigned_to_name,
+                system: system_name,
+                department: department,
+                branch: branch
+            });
+
+            console.log(`✅ Ticket ${finalTicketSl} imported successfully`);
+
+        } catch (err) {
+            console.error(`❌ Error importing ticket ${i + 1}:`, err.message);
+            results.failed.push({
+                ticket_sl: ticket.ticket_sl || `row_${i + 1}`,
+                reporter: ticket.reporter_name || 'Unknown',
+                error: err.message
+            });
+        }
+    }
+
+    console.log("\n📊 ========== BULK IMPORT SUMMARY ==========");
+    console.log(`✅ Successful: ${results.successful.length}`);
+    console.log(`❌ Failed: ${results.failed.length}`);
+    console.log(`📈 Success Rate: ${((results.successful.length / results.total) * 100).toFixed(1)}%`);
+
+    res.status(200).json({
+        message: `Bulk import completed: ${results.successful.length} successful, ${results.failed.length} failed`,
+        summary: {
+            total: results.total,
+            successful: results.successful.length,
+            failed: results.failed.length,
+            success_rate: `${((results.successful.length / results.total) * 100).toFixed(1)}%`
+        },
+        results: results
+    });
+};
