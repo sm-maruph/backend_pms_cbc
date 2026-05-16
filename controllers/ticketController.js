@@ -387,9 +387,12 @@ exports.getTicketBySL = async (req, res) => {
 // ============================================
 // VALIDATE BULK TICKETS (Check before import)
 // ============================================
+// ============================================
+// VALIDATE BULK TICKETS (Updated - only checks essential fields)
+// ============================================
 exports.validateBulkTickets = async (req, res) => {
     console.log("🔍 ========== VALIDATE BULK TICKETS ==========");
-
+    
     const tickets = req.body;
     const validationResults = {
         valid: [],
@@ -398,28 +401,26 @@ exports.validateBulkTickets = async (req, res) => {
             total: tickets.length,
             validCount: 0,
             invalidCount: 0,
-            missingEmails: [],
             missingRequiredFields: []
         }
     };
 
-    const requiredFields = ['system_name', 'problem_details', 'department', 'branch', 'reported_by_email', 'reporter_name'];
+    // Only problem_details is truly required (like createTicket)
+    const requiredFields = ['problem_details'];
 
     for (let i = 0; i < tickets.length; i++) {
         const ticket = tickets[i];
         const errors = [];
 
         const isEmpty = (value) => {
-            return value === undefined || value === null || value === '' ||
-                String(value).trim() === '' || String(value).trim() === 'NaN';
+            return value === undefined || value === null || value === '' || 
+                   String(value).trim() === '' || String(value).trim() === 'NaN';
         };
 
+        // Check only essential required fields
         for (const field of requiredFields) {
             if (isEmpty(ticket[field])) {
                 errors.push(`${field} is required`);
-                if (field === 'reported_by_email') {
-                    validationResults.summary.missingEmails.push(ticket.reporter_name || `row_${i + 1}`);
-                }
             }
         }
 
@@ -435,21 +436,18 @@ exports.validateBulkTickets = async (req, res) => {
             validationResults.valid.push({
                 row: i + 1,
                 ticket_sl: ticket.ticket_sl || 'will be auto-generated',
-                reporter: ticket.reporter_name,
-                system: ticket.system_name
+                reporter: ticket.reporter_name || 'Will use admin',
+                system: ticket.system_name || 'Not Specified'
             });
             validationResults.summary.validCount++;
         }
     }
 
-    validationResults.summary.missingEmails = [...new Set(validationResults.summary.missingEmails)];
+    console.log(`📊 Validation: ${validationResults.summary.validCount} valid, ${validationResults.summary.invalidCount} invalid`);
 
     res.status(200).json(validationResults);
 };
 
-// ============================================
-// BULK IMPORT TICKETS (Actual import)
-// ============================================
 // ============================================
 // BULK IMPORT TICKETS (Updated - Fetches emails from Users table)
 // ============================================
