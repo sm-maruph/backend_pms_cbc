@@ -53,6 +53,356 @@ exports.getMyTickets = async (req, res) => {
     }
 };
 
+
+// ============================================
+// GET PAGINATED TICKETS (For table with filters)
+// ============================================
+exports.getPaginatedTickets = async (req, res) => {
+    try {
+        const pool = await poolPromise;
+
+        const page = parseInt(req.query.page) || 1;
+        const pageSize = parseInt(req.query.pageSize) || 50;
+        const offset = (page - 1) * pageSize;
+
+        const status = req.query.status || 'all';
+        const search = req.query.search || '';
+        const dateFilter = req.query.dateFilter || 'all';
+        const sortBy = req.query.sortBy || 'date';
+
+        console.log('📊 Fetching tickets with filters:', { page, pageSize, status, search, dateFilter, sortBy });
+
+        // Build WHERE clause
+        let whereClause = 'WHERE 1=1';
+        const params = {};
+
+        // Status filter
+        if (status !== 'all') {
+            whereClause += ' AND t.status = @status';
+            params.status = status;
+        }
+
+        // Search filter
+        if (search) {
+            whereClause += ` AND (
+                t.system_name LIKE @search OR 
+                t.problem_details LIKE @search OR 
+                t.affected_user LIKE @search OR
+                u.name LIKE @search OR
+                t.ticket_sl LIKE @search
+            )`;
+            params.search = `%${search}%`;
+        }
+
+        // Date filter - Using same logic as frontend (based on date field)
+        if (dateFilter !== 'all') {
+            const dateRange = getDateRangeForFilter(dateFilter);
+            console.log('🔍 DATE FILTER DEBUG:');
+            console.log('  - Filter type:', dateFilter);
+            console.log('  - Start date:', dateRange.startDate);
+            console.log('  - End date:', dateRange.endDate);
+
+            if (dateRange.startDate && dateRange.endDate) {
+                whereClause += ' AND t.date >= @startDate AND t.date <= @endDate';
+                params.startDate = dateRange.startDate;
+                params.endDate = dateRange.endDate;
+                console.log('  - WHERE clause added with date range');
+            } else {
+                console.log('  - No date range applied - check getDateRangeForFilter');
+            }
+        } else {
+            console.log('  - Date filter is "all" - no date filter applied');
+        }
+
+        // Build ORDER BY
+        let orderBy = '';
+        switch (sortBy) {
+            case 'date':
+                orderBy = 'ORDER BY t.created_at DESC';
+                break;
+            case 'status':
+                orderBy = 'ORDER BY t.status';
+                break;
+            case 'risk':
+                orderBy = `ORDER BY 
+                    CASE t.risk_label 
+                        WHEN 'HIGH' THEN 3 
+                        WHEN 'MEDIUM' THEN 2 
+                        WHEN 'LOW' THEN 1 
+                        ELSE 0 
+                    END DESC`;
+                break;
+            default:
+                orderBy = 'ORDER BY t.created_at DESC';
+        }
+
+        // Get total count
+        const countRequest = pool.request();
+        // ✅ ADD THIS - Add parameters to countRequest
+        if (params.status) {
+            countRequest.input('status', sql.NVarChar, params.status);
+        }
+        if (params.search) {
+            countRequest.input('search', sql.NVarChar, params.search);
+        }
+        if (params.startDate) {
+            countRequest.input('startDate', sql.Date, params.startDate);
+        }
+        if (params.endDate) {
+            countRequest.input('endDate', sql.Date, params.endDate);
+        }
+        const countResult = await countRequest.query(`
+            SELECT COUNT(*) as total
+            FROM Tickets t
+            LEFT JOIN Users u ON t.reported_by_email = u.email
+            ${whereClause}
+        `);
+
+        const totalCount = countResult.recordset[0].total;
+
+        // Get paginated data
+        const dataRequest = pool.request();
+        for (const [key, value] of Object.entries(params)) {
+            if (key === 'startDate' || key === 'endDate') {
+                dataRequest.input(key, sql.Date, value);
+            } else {
+                dataRequest.input(key, sql.NVarChar, value);
+            }
+        }
+        dataRequest.input('offset', sql.Int, offset);
+        dataRequest.input('pageSize', sql.Int, pageSize);
+
+        const result = await dataRequest.query(`
+            SELECT 
+                t.*, 
+                u.name as reportedByName,
+                assigned_user.name as assignedToName
+            FROM Tickets t
+            LEFT JOIN Users u ON t.reported_by_email = u.email
+            LEFT JOIN Users assigned_user ON t.assigned_to_email = assigned_user.email
+            ${whereClause}
+            ${orderBy}
+            OFFSET @offset ROWS
+            FETCH NEXT @pageSize ROWS ONLY
+        `);
+
+        res.json({
+            tickets: result.recordset,
+            pagination: {
+                currentPage: page,
+                pageSize: pageSize,
+                totalCount: totalCount,
+                totalPages: Math.ceil(totalCount / pageSize),
+                hasNext: page < Math.ceil(totalCount / pageSize),
+                hasPrev: page > 1
+            }
+        });
+
+    } catch (err) {
+        console.error('Error fetching paginated tickets:', err);
+        res.status(500).json({ message: 'Error fetching tickets', error: err.message });
+    }
+};
+
+// ============================================
+// GET DASHBOARD STATS (For charts and cards)
+// ============================================
+exports.getDashboardStats = async (req, res) => {
+    try {
+        const pool = await poolPromise;
+        const { dateFilter = 'all' } = req.query;
+
+        console.log('📊 Fetching dashboard stats with filter:', dateFilter);
+
+        // Build WHERE clause using same date logic
+        let whereClause = 'WHERE 1=1';
+        const params = {};
+
+        // Date filter - Using same logic as frontend
+        if (dateFilter !== 'all') {
+            const dateRange = getDateRangeForFilter(dateFilter);
+            console.log('🔍 Date range:', dateRange);
+
+            if (dateRange.startDate && dateRange.endDate) {
+                whereClause += ' AND t.date >= @startDate AND t.date <= @endDate';
+                params.startDate = dateRange.startDate;
+                params.endDate = dateRange.endDate;
+                console.log('✅ WHERE clause added with date range');
+                console.log('✅ Params:', params);
+            }
+        }
+
+        // Create request and add parameters
+        const statsRequest = pool.request();
+
+        // ✅ IMPORTANT: Add parameters to the request
+        if (params.startDate) {
+            statsRequest.input('startDate', sql.Date, params.startDate);
+        }
+        if (params.endDate) {
+            statsRequest.input('endDate', sql.Date, params.endDate);
+        }
+
+        console.log('📝 Final WHERE clause:', whereClause);
+
+        const result = await statsRequest.query(`
+            SELECT 
+                COUNT(*) as total_tickets,
+                SUM(CASE WHEN t.status = 'open' THEN 1 ELSE 0 END) as open_count,
+                SUM(CASE WHEN t.status = 'in-progress' THEN 1 ELSE 0 END) as in_progress_count,
+                SUM(CASE WHEN t.status = 'resolved' THEN 1 ELSE 0 END) as resolved_count,
+                SUM(CASE WHEN t.status != 'resolved' THEN 1 ELSE 0 END) as active_tickets,
+                SUM(CASE WHEN t.status != 'resolved' AND t.risk_label = 'HIGH' THEN 1 ELSE 0 END) as high_risk_count,
+                SUM(CASE WHEN t.status != 'resolved' AND t.risk_label = 'MEDIUM' THEN 1 ELSE 0 END) as medium_risk_count,
+                SUM(CASE WHEN t.status != 'resolved' AND t.risk_label = 'LOW' THEN 1 ELSE 0 END) as low_risk_count
+            FROM Tickets t
+            ${whereClause}
+        `);
+
+        const stats = result.recordset[0];
+
+        console.log('📊 Stats result:', {
+            total: stats.total_tickets,
+            open: stats.open_count,
+            inProgress: stats.in_progress_count,
+            resolved: stats.resolved_count,
+            dateFilter: dateFilter
+        });
+
+        // Prepare chart data
+        const statusChartData = [
+            { name: "Open", value: stats.open_count || 0, color: "#ef4444" },
+            { name: "In Progress", value: stats.in_progress_count || 0, color: "#eab308" },
+            { name: "Resolved", value: stats.resolved_count || 0, color: "#22c55e" }
+        ].filter(item => item.value > 0);
+
+        const riskChartData = [
+            { name: "Low Risk", value: stats.low_risk_count || 0, color: "#3b82f6" },
+            { name: "Medium Risk", value: stats.medium_risk_count || 0, color: "#f97316" },
+            { name: "High Risk", value: stats.high_risk_count || 0, color: "#ef4444" }
+        ].filter(item => item.value > 0);
+
+        res.json({
+            stats: {
+                total: stats.total_tickets || 0,
+                open: stats.open_count || 0,
+                progress: stats.in_progress_count || 0,
+                resolved: stats.resolved_count || 0,
+                activeTotal: stats.active_tickets || 0,
+                highRisk: stats.high_risk_count || 0,
+                mediumRisk: stats.medium_risk_count || 0,
+                lowRisk: stats.low_risk_count || 0
+            },
+            statusChartData,
+            riskChartData
+        });
+
+    } catch (err) {
+        console.error('Error fetching dashboard stats:', err);
+        res.status(500).json({ message: 'Error fetching stats', error: err.message });
+    }
+};
+// ============================================
+// HELPER: Get date range for filter (Matches frontend logic)
+// ============================================
+// ============================================
+// HELPER: Get date range for filter (Matches frontend logic exactly)
+// ============================================
+function getDateRangeForFilter(dateFilter) {
+    const now = new Date();
+    let startDate = null;
+    let endDate = null;
+
+    // Helper to set time to start of day (12:00 AM)
+    const startOfDay = (date) => {
+        const d = new Date(date);
+        d.setHours(0, 0, 0, 0);
+        return d;
+    };
+
+    // Helper to set time to end of day (11:59:59 PM)
+    const endOfDay = (date) => {
+        const d = new Date(date);
+        d.setHours(23, 59, 59, 999);
+        return d;
+    };
+
+    switch (dateFilter) {
+        case 'today': {
+            // Today from 12:00 AM to 11:59 PM
+            startDate = startOfDay(now);
+            endDate = endOfDay(now);
+            break;
+        }
+        case 'yesterday': {
+            // Yesterday from 12:00 AM to 11:59 PM
+            const yesterday = new Date(now);
+            yesterday.setDate(yesterday.getDate() - 1);
+            startDate = startOfDay(yesterday);
+            endDate = endOfDay(yesterday);
+            break;
+        }
+        case 'week': {
+            // Current week (Sunday to Saturday)
+            const currentDay = now.getDay(); // 0 = Sunday, 6 = Saturday
+            const startOfWeek = new Date(now);
+            startOfWeek.setDate(now.getDate() - currentDay); // Go back to Sunday
+            startDate = startOfDay(startOfWeek);
+
+            const endOfWeek = new Date(startOfWeek);
+            endOfWeek.setDate(startOfWeek.getDate() + 6); // Go to Saturday
+            endDate = endOfDay(endOfWeek);
+            break;
+        }
+        case 'month': {
+            // FULL CURRENT MONTH (1st to last day of the month)
+            const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+            startDate = startOfDay(startOfMonth);
+
+            const endOfMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0);
+            endDate = endOfDay(endOfMonth);
+            break;
+        }
+        case 'quarter': {
+            // FULL CURRENT QUARTER (quarter start to quarter end)
+            const quarter = Math.floor(now.getMonth() / 3);
+            const startMonth = quarter * 3;
+            const startOfQuarter = new Date(now.getFullYear(), startMonth, 1);
+            startDate = startOfDay(startOfQuarter);
+
+            const endOfQuarter = new Date(now.getFullYear(), startMonth + 3, 0);
+            endDate = endOfDay(endOfQuarter);
+            break;
+        }
+        case 'year': {
+            // FULL CURRENT YEAR (Jan 1 to Dec 31)
+            const startOfYear = new Date(now.getFullYear(), 0, 1);
+            startDate = startOfDay(startOfYear);
+
+            const endOfYear = new Date(now.getFullYear(), 11, 31);
+            endDate = endOfDay(endOfYear);
+            break;
+        }
+        default:
+            return { startDate: null, endDate: null };
+    }
+
+    // Format for SQL Server (YYYY-MM-DD)
+    const formatDateForSQL = (date) => {
+        if (!date) return null;
+        const year = date.getFullYear();
+        const month = String(date.getMonth() + 1).padStart(2, '0');
+        const day = String(date.getDate()).padStart(2, '0');
+        return `${year}-${month}-${day}`;
+    };
+
+    const formattedStartDate = formatDateForSQL(startDate);
+    const formattedEndDate = formatDateForSQL(endDate);
+
+    console.log(`📅 Date filter '${dateFilter}' -> start: ${formattedStartDate}, end: ${formattedEndDate}`);
+
+    return { startDate: formattedStartDate, endDate: formattedEndDate };
+}
 exports.createTicket = async (req, res) => {
     console.log("📥 ========== CREATE TICKET REQUEST ==========");
     console.log("📦 Request body:", JSON.stringify(req.body, null, 2));
@@ -100,7 +450,6 @@ exports.createTicket = async (req, res) => {
         let formattedDownTime = null;
         if (downTime) {
             try {
-                // Try to parse the date string
                 const parsedDate = new Date(downTime);
                 if (!isNaN(parsedDate.getTime())) {
                     formattedDownTime = parsedDate;
@@ -175,16 +524,13 @@ exports.createTicket = async (req, res) => {
         console.log("✅ Ticket inserted successfully:", ticket_sl);
 
         // ============================================================
-        // 🔔 SEND NOTIFICATIONS TO ALL USERS (ADMINS + REGULAR USERS)
+        // 🔔 SEND NOTIFICATIONS TO ALL USERS
         // ============================================================
-
-        // Helper function to get ALL users
         const getAllUsers = async () => {
             const result = await pool.request().query("SELECT email, name, role FROM Users");
             return result.recordset;
         };
 
-        // Helper function to save notification (import from notificationController)
         const saveNotification = async (userEmail, notification, ticket_sl = null, metadata = null) => {
             try {
                 await pool.request()
@@ -195,9 +541,9 @@ exports.createTicket = async (req, res) => {
                     .input('ticket_sl', sql.NVarChar, ticket_sl)
                     .input('metadata', sql.NVarChar, metadata ? JSON.stringify(metadata) : null)
                     .query(`
-                INSERT INTO Notifications (user_email, type, title, message, ticket_sl, metadata, created_at)
-                VALUES (@user_email, @type, @title, @message, @ticket_sl, @metadata, GETDATE())
-            `);
+                        INSERT INTO Notifications (user_email, type, title, message, ticket_sl, metadata, created_at)
+                        VALUES (@user_email, @type, @title, @message, @ticket_sl, @metadata, GETDATE())
+                    `);
                 return true;
             } catch (err) {
                 console.error('Failed to save notification:', err);
@@ -205,11 +551,9 @@ exports.createTicket = async (req, res) => {
             }
         };
 
-        // Get ALL users from the system
         const allUsers = await getAllUsers();
         console.log(`📢 Sending notifications to ${allUsers.length} users...`);
 
-        // Create notification message
         const riskEmoji = riskLabel === 'HIGH' ? '🔴' : riskLabel === 'MEDIUM' ? '🟡' : '🟢';
         const notification = {
             type: 'new_ticket',
@@ -220,15 +564,9 @@ exports.createTicket = async (req, res) => {
         const io = req.app.get('io');
         const connectedUsers = req.app.get('connectedUsers');
 
-        // Send notification to EVERY user in the system
         for (const user of allUsers) {
-            // Skip sending to the ticket creator? (Optional - remove if you want creator to also get notification)
             if (user.email === reportedByEmail) continue;
-
-            // Save to database for each user
             await saveNotification(user.email, notification, ticket_sl);
-
-            // Send real-time if user is connected
             const socketId = connectedUsers?.get(user.email);
             if (socketId && io) {
                 io.to(socketId).emit('notification', {
@@ -237,10 +575,34 @@ exports.createTicket = async (req, res) => {
                     created_at: new Date().toISOString(),
                     is_read: 0
                 });
-                console.log(`✅ Real-time notification sent to ${user.email} (${user.role})`);
-            } else {
-                console.log(`⏸️ User ${user.email} (${user.role}) is offline - notification saved to DB`);
+                console.log(`✅ Real-time notification sent to ${user.email}`);
             }
+        }
+
+        // ============================================================
+        // 🚀 EMIT REAL-TIME TICKET UPDATES (ADD THIS SECTION)
+        // ============================================================
+        if (io) {
+            // Emit to all connected clients that a new ticket was created
+            io.emit('ticket-created', {
+                ticket: {
+                    ticket_sl: ticket_sl,
+                    systemName: systemName,
+                    reporterName: reporterName,
+                    status: 'open',
+                    riskLevel: riskLabel,
+                    createdAt: new Date()
+                },
+                message: `New ticket ${ticket_sl} created by ${reporterName}`
+            });
+            console.log('📡 Emitted ticket-created event to all clients');
+
+            // Also emit stats update
+            io.emit('stats-updated', {
+                reason: 'new_ticket',
+                timestamp: new Date()
+            });
+            console.log('📡 Emitted stats-updated event to all clients');
         }
 
         console.log(`✅ Notifications sent to all ${allUsers.length} users`);
@@ -259,13 +621,13 @@ exports.createTicket = async (req, res) => {
     }
 };
 
-
 exports.updateTicket = async (req, res) => {
     const { id } = req.params;
     const updates = req.body;
 
     console.log("📥 Update request for ticket:", id);
     console.log("📦 Update data:", updates);
+    console.log("👤 Updated by:", req.user?.email);
 
     // Update allowed fields to include new schema fields
     const allowed = [
@@ -279,6 +641,34 @@ exports.updateTicket = async (req, res) => {
     const pool = await poolPromise;
     const request = pool.request();
     request.input('id', sql.Int, id);
+
+    // FIRST: Get the old ticket data for comparison and notifications
+    const oldTicketResult = await pool.request()
+        .input('id', sql.Int, id)
+        .query(`
+            SELECT 
+                t.*, 
+                u.name as reportedByName,
+                assigned_user.name as assignedToName
+            FROM Tickets t
+            LEFT JOIN Users u ON t.reported_by_email = u.email
+            LEFT JOIN Users assigned_user ON t.assigned_to_email = assigned_user.email
+            WHERE t.id = @id
+        `);
+
+    const oldTicket = oldTicketResult.recordset[0];
+
+    if (!oldTicket) {
+        return res.status(404).json({ message: 'Ticket not found' });
+    }
+
+    console.log("📋 Old ticket data:", {
+        id: oldTicket.id,
+        ticket_sl: oldTicket.ticket_sl,
+        status: oldTicket.status,
+        assigned_to_email: oldTicket.assigned_to_email,
+        risk_label: oldTicket.risk_label
+    });
 
     for (let field of allowed) {
         if (updates[field] !== undefined) {
@@ -304,13 +694,15 @@ exports.updateTicket = async (req, res) => {
     }
 
     // If assigned_to_email is updated, also update assigned_to_name
+    let newAssigneeName = null;
     if (updates.assigned_to_email) {
         const userResult = await pool.request()
             .input('email', sql.NVarChar, updates.assigned_to_email)
             .query('SELECT name FROM Users WHERE email = @email');
 
         if (userResult.recordset[0]) {
-            request.input('assigned_to_name', sql.NVarChar, userResult.recordset[0].name);
+            newAssigneeName = userResult.recordset[0].name;
+            request.input('assigned_to_name', sql.NVarChar, newAssigneeName);
             setClause.push('assigned_to_name = @assigned_to_name');
         }
     }
@@ -333,13 +725,246 @@ exports.updateTicket = async (req, res) => {
         const query = `UPDATE Tickets SET ${setClause.join(', ')} WHERE id = @id`;
         console.log("📝 Update query:", query);
         await request.query(query);
-        res.json({ message: 'Ticket updated successfully' });
+
+        // ============================================================
+        // FETCH UPDATED TICKET DATA
+        // ============================================================
+        const updatedTicketResult = await pool.request()
+            .input('id', sql.Int, id)
+            .query(`
+                SELECT 
+                    t.*, 
+                    u.name as reportedByName,
+                    assigned_user.name as assignedToName
+                FROM Tickets t
+                LEFT JOIN Users u ON t.reported_by_email = u.email
+                LEFT JOIN Users assigned_user ON t.assigned_to_email = assigned_user.email
+                WHERE t.id = @id
+            `);
+
+        const updatedTicket = updatedTicketResult.recordset[0];
+
+        // ============================================================
+        // SEND NOTIFICATIONS FOR CHANGES
+        // ============================================================
+        const io = req.app.get('io');
+        const connectedUsers = req.app.get('connectedUsers');
+
+        // Helper function to save notification
+        const saveNotification = async (userEmail, notification, ticket_sl = null, metadata = null) => {
+            try {
+                await pool.request()
+                    .input('user_email', sql.NVarChar, userEmail)
+                    .input('type', sql.NVarChar, notification.type)
+                    .input('title', sql.NVarChar, notification.title)
+                    .input('message', sql.NVarChar, notification.message)
+                    .input('ticket_sl', sql.NVarChar, ticket_sl)
+                    .input('metadata', sql.NVarChar, metadata ? JSON.stringify(metadata) : null)
+                    .query(`
+                        INSERT INTO Notifications (user_email, type, title, message, ticket_sl, metadata, created_at)
+                        VALUES (@user_email, @type, @title, @message, @ticket_sl, @metadata, GETDATE())
+                    `);
+                return true;
+            } catch (err) {
+                console.error('Failed to save notification:', err);
+                return false;
+            }
+        };
+
+        const updatedBy = req.user?.name || req.user?.email || 'System';
+
+        // 1. STATUS CHANGE NOTIFICATION
+        if (updates.status && oldTicket.status !== updates.status) {
+            const statusMessages = {
+                'open': 'reopened',
+                'in-progress': 'started working on',
+                'resolved': 'resolved'
+            };
+
+            const action = statusMessages[updates.status] || `changed status to ${updates.status}`;
+            const statusNotification = {
+                type: 'status_change',
+                title: `📝 Ticket Status Changed`,
+                message: `${updatedBy} ${action} ticket ${oldTicket.ticket_sl}`
+            };
+
+            // Notify reporter and assignee
+            const usersToNotify = [oldTicket.reported_by_email];
+            if (oldTicket.assigned_to_email && oldTicket.assigned_to_email !== oldTicket.reported_by_email) {
+                usersToNotify.push(oldTicket.assigned_to_email);
+            }
+
+            for (const userEmail of usersToNotify) {
+                if (userEmail && userEmail !== req.user?.email) {
+                    await saveNotification(userEmail, statusNotification, oldTicket.ticket_sl, {
+                        oldStatus: oldTicket.status,
+                        newStatus: updates.status,
+                        updatedBy: updatedBy
+                    });
+
+                    const socketId = connectedUsers?.get(userEmail);
+                    if (socketId && io) {
+                        io.to(socketId).emit('notification', {
+                            ...statusNotification,
+                            id: oldTicket.ticket_sl,
+                            created_at: new Date().toISOString(),
+                            is_read: 0,
+                            ticket_sl: oldTicket.ticket_sl
+                        });
+                    }
+                }
+            }
+        }
+
+        // 2. ASSIGNMENT CHANGE NOTIFICATION
+        if (updates.assigned_to_email && oldTicket.assigned_to_email !== updates.assigned_to_email) {
+            const assignmentNotification = {
+                type: 'assignment',
+                title: `📌 Ticket Assigned`,
+                message: `${updatedBy} assigned ticket ${oldTicket.ticket_sl} to ${newAssigneeName || updates.assigned_to_email}`
+            };
+
+            // Notify new assignee
+            await saveNotification(updates.assigned_to_email, assignmentNotification, oldTicket.ticket_sl, {
+                assignedBy: updatedBy,
+                ticketTitle: oldTicket.system_name
+            });
+
+            const newAssigneeSocketId = connectedUsers?.get(updates.assigned_to_email);
+            if (newAssigneeSocketId && io) {
+                io.to(newAssigneeSocketId).emit('notification', {
+                    ...assignmentNotification,
+                    id: oldTicket.ticket_sl,
+                    created_at: new Date().toISOString(),
+                    is_read: 0,
+                    ticket_sl: oldTicket.ticket_sl
+                });
+            }
+
+            // Also notify reporter that ticket was assigned
+            if (oldTicket.reported_by_email && oldTicket.reported_by_email !== updates.assigned_to_email) {
+                const reporterNotification = {
+                    type: 'assignment_update',
+                    title: `📌 Ticket Assignment Update`,
+                    message: `Ticket ${oldTicket.ticket_sl} has been assigned to ${newAssigneeName || updates.assigned_to_email}`
+                };
+
+                await saveNotification(oldTicket.reported_by_email, reporterNotification, oldTicket.ticket_sl);
+
+                const reporterSocketId = connectedUsers?.get(oldTicket.reported_by_email);
+                if (reporterSocketId && io) {
+                    io.to(reporterSocketId).emit('notification', reporterNotification);
+                }
+            }
+        }
+
+        // 3. RISK LEVEL CHANGE NOTIFICATION
+        if (updates.risk_label && oldTicket.risk_label !== updates.risk_label) {
+            const riskNotification = {
+                type: 'risk_change',
+                title: `⚠️ Risk Level Changed`,
+                message: `${updatedBy} changed risk level of ticket ${oldTicket.ticket_sl} from ${oldTicket.risk_label} to ${updates.risk_label}`
+            };
+
+            const usersToNotify = [oldTicket.reported_by_email];
+            if (oldTicket.assigned_to_email && oldTicket.assigned_to_email !== oldTicket.reported_by_email) {
+                usersToNotify.push(oldTicket.assigned_to_email);
+            }
+
+            for (const userEmail of usersToNotify) {
+                if (userEmail && userEmail !== req.user?.email) {
+                    await saveNotification(userEmail, riskNotification, oldTicket.ticket_sl);
+
+                    const socketId = connectedUsers?.get(userEmail);
+                    if (socketId && io) {
+                        io.to(socketId).emit('notification', riskNotification);
+                    }
+                }
+            }
+        }
+
+        // ============================================================
+        // EMIT REAL-TIME SOCKET EVENTS
+        // ============================================================
+
+        if (io) {
+            // Emit to all clients that a ticket was updated
+            io.emit('ticket-updated', {
+                ticket: updatedTicket,
+                changes: updates,
+                oldData: {
+                    status: oldTicket.status,
+                    assigned_to_email: oldTicket.assigned_to_email,
+                    risk_label: oldTicket.risk_label
+                },
+                updatedBy: updatedBy,
+                timestamp: new Date()
+            });
+            console.log('📡 Emitted ticket-updated event to all clients');
+
+            // Emit to specific ticket room (for users viewing this ticket)
+            io.to(`ticket_${id}`).emit('ticket-detail-updated', {
+                ticket: updatedTicket,
+                changes: updates,
+                updatedBy: updatedBy,
+                timestamp: new Date()
+            });
+            console.log(`📡 Emitted ticket-detail-updated to room ticket_${id}`);
+
+            // Emit stats update if status or risk changed
+            if (updates.status || updates.risk_label) {
+                io.emit('stats-updated', {
+                    reason: 'ticket_updated',
+                    ticketId: updatedTicket.ticket_sl,
+                    changes: {
+                        status: updates.status,
+                        risk: updates.risk_label
+                    },
+                    timestamp: new Date()
+                });
+                console.log('📡 Emitted stats-updated event to all clients');
+            }
+
+            // Emit specific event for status changes
+            if (updates.status && oldTicket.status !== updates.status) {
+                io.emit('ticket-status-changed', {
+                    ticketId: updatedTicket.ticket_sl,
+                    ticketSl: oldTicket.ticket_sl,
+                    oldStatus: oldTicket.status,
+                    newStatus: updates.status,
+                    updatedBy: updatedBy,
+                    timestamp: new Date()
+                });
+                console.log(`📡 Emitted ticket-status-changed: ${oldTicket.status} -> ${updates.status}`);
+            }
+
+            // Emit specific event for assignment changes
+            if (updates.assigned_to_email && oldTicket.assigned_to_email !== updates.assigned_to_email) {
+                io.emit('ticket-assigned', {
+                    ticketId: updatedTicket.ticket_sl,
+                    ticketSl: oldTicket.ticket_sl,
+                    oldAssignee: oldTicket.assigned_to_email,
+                    newAssignee: updates.assigned_to_email,
+                    newAssigneeName: newAssigneeName,
+                    assignedBy: updatedBy,
+                    timestamp: new Date()
+                });
+                console.log(`📡 Emitted ticket-assigned: ${oldTicket.assigned_to_email} -> ${updates.assigned_to_email}`);
+            }
+        }
+
+        console.log("✅ Ticket updated successfully:", oldTicket.ticket_sl);
+        res.json({
+            message: 'Ticket updated successfully',
+            ticket: updatedTicket,
+            changes: updates
+        });
+
     } catch (err) {
         console.error('Update error:', err);
         res.status(500).json({ message: 'Update failed', error: err.message });
     }
 };
-
 exports.deleteTicket = async (req, res) => {
     const { id } = req.params;
     try {
@@ -392,7 +1017,7 @@ exports.getTicketBySL = async (req, res) => {
 // ============================================
 exports.validateBulkTickets = async (req, res) => {
     console.log("🔍 ========== VALIDATE BULK TICKETS ==========");
-    
+
     const tickets = req.body;
     const validationResults = {
         valid: [],
@@ -413,8 +1038,8 @@ exports.validateBulkTickets = async (req, res) => {
         const errors = [];
 
         const isEmpty = (value) => {
-            return value === undefined || value === null || value === '' || 
-                   String(value).trim() === '' || String(value).trim() === 'NaN';
+            return value === undefined || value === null || value === '' ||
+                String(value).trim() === '' || String(value).trim() === 'NaN';
         };
 
         // Check only essential required fields

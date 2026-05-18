@@ -33,12 +33,25 @@ const connectedUsers = new Map();
 // Socket.IO connection handling
 io.on('connection', (socket) => {
     console.log('New client connected:', socket.id);
-    
+
     socket.on('register', (userEmail) => {
         connectedUsers.set(userEmail, socket.id);
         console.log(`User ${userEmail} registered with socket ${socket.id}`);
     });
-    
+
+
+    // Join specific ticket room for real-time updates on that ticket
+    socket.on('join-ticket-room', (ticketId) => {
+        socket.join(`ticket_${ticketId}`);
+        console.log(`Socket ${socket.id} joined room ticket_${ticketId}`);
+    });
+
+    // Leave ticket room
+    socket.on('leave-ticket-room', (ticketId) => {
+        socket.leave(`ticket_${ticketId}`);
+        console.log(`Socket ${socket.id} left room ticket_${ticketId}`);
+    });
+
     socket.on('disconnect', () => {
         for (const [email, id] of connectedUsers.entries()) {
             if (id === socket.id) {
@@ -47,8 +60,31 @@ io.on('connection', (socket) => {
                 break;
             }
         }
+        console.log(`📊 Total connected users: ${connectedUsers.size}`);
+
     });
 });
+
+// Helper function to emit to specific user (add this after io.on)
+const emitToUser = (userEmail, eventName, data) => {
+    const socketId = connectedUsers.get(userEmail);
+    if (socketId && io) {
+        io.to(socketId).emit(eventName, data);
+        console.log(`📡 Emitted ${eventName} to user: ${userEmail}`);
+        return true;
+    }
+    return false;
+};
+
+// Helper function to emit to all connected clients
+const emitToAll = (eventName, data) => {
+    io.emit(eventName, data);
+    console.log(`📡 Emitted ${eventName} to all connected clients`);
+};
+
+// Make helpers available to routes
+app.set('emitToUser', emitToUser);
+app.set('emitToAll', emitToAll);
 
 // Make io and connectedUsers available to routes
 app.set('io', io);

@@ -8,12 +8,14 @@ const {
     updateTicket,
     deleteTicket,
     getTicketBySL,
-    validateBulkTickets,    // ✅ Add this
-    bulkImportTickets    // Add this new function
+    validateBulkTickets,
+    bulkImportTickets,
+    getPaginatedTickets,    // ✅ Add this - paginated tickets
+    getDashboardStats       // ✅ Add this - dashboard statistics
 } = require('../controllers/ticketController');
 const { validateTicket } = require('../middleware/validation');
 
-// ✅ Simple admin check middleware (add this here)
+// ✅ Simple admin check middleware
 const adminOnly = (req, res, next) => {
     if (req.user && req.user.role === 'admin') {
         next();
@@ -22,7 +24,23 @@ const adminOnly = (req, res, next) => {
     }
 };
 
+// Apply authentication to all routes
 router.use(auth);
+
+// ============================================
+// DASHBOARD & PAGINATION ROUTES (NEW)
+// ============================================
+
+// Get dashboard statistics (for charts and cards)
+// This should be before the /:id route to avoid conflicts
+router.get('/stats', getDashboardStats);
+
+// Get paginated tickets with filters (for table)
+router.get('/paginated', getPaginatedTickets);
+
+// ============================================
+// EXISTING ROUTES
+// ============================================
 
 // Get all tickets (admin only or all users - depends on your requirement)
 router.get('/', getAllTickets);
@@ -30,13 +48,20 @@ router.get('/', getAllTickets);
 // Get my tickets (reported by or assigned to current user)
 router.get('/my', getMyTickets);
 
-// ✅ BULK IMPORT ROUTES - Fixed (no protect, use adminOnly)
+// Get ticket by SL (moved before /:id to avoid conflicts)
+router.get('/sl/:ticket_sl', getTicketBySL);
+
+// ============================================
+// BULK IMPORT ROUTES
+// ============================================
 router.post('/bulk-import/validate', adminOnly, validateBulkTickets);
 router.post('/bulk-import', adminOnly, bulkImportTickets);
 
+// ============================================
+// CRUD OPERATIONS
+// ============================================
 
 // Create new ticket
-// Add debug logging for POST
 router.post('/', (req, res, next) => {
     console.log("🔵 POST /api/tickets - Request received");
     console.log("🔵 Headers:", req.headers);
@@ -50,7 +75,7 @@ router.post('/', (req, res, next) => {
 // Update ticket by ID
 router.put('/:id', updateTicket);
 
-// Delete ticket by ID (admin only - you might want to add admin check)
-router.delete('/:id', deleteTicket);
+// Delete ticket by ID (admin only)
+router.delete('/:id', adminOnly, deleteTicket);
 
 module.exports = router;
