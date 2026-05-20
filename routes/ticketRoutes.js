@@ -11,7 +11,9 @@ const {
     validateBulkTickets,
     bulkImportTickets,
     getPaginatedTickets,    // ✅ Add this - paginated tickets
-    getDashboardStats       // ✅ Add this - dashboard statistics
+    getDashboardStats,      // ✅ Add this - dashboard statistics
+    getTopSystems,      // ✅ Add this
+    getDownAtms 
 } = require('../controllers/ticketController');
 const { validateTicket } = require('../middleware/validation');
 
@@ -50,6 +52,9 @@ router.get('/my', getMyTickets);
 
 // Get ticket by SL (moved before /:id to avoid conflicts)
 router.get('/sl/:ticket_sl', getTicketBySL);
+
+router.get('/dashboard/top-systems', getTopSystems);
+router.get('/dashboard/down-atms', getDownAtms);
 
 // ============================================
 // BULK IMPORT ROUTES

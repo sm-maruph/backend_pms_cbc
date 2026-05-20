@@ -605,6 +605,23 @@ exports.createTicket = async (req, res) => {
             console.log('📡 Emitted stats-updated event to all clients');
         }
 
+        // Emit top systems update
+        io.emit('top-systems-updated', {
+            reason: 'new_ticket',
+            timestamp: new Date()
+        });
+
+        // Check if this ticket is an ATM and emit down ATMs update
+        if (systemName && (systemName.toLowerCase().includes('atm') ||
+            problemDetails.toLowerCase().includes('atm'))) {
+            io.emit('down-atms-updated', {
+                reason: 'new_atm_ticket',
+                timestamp: new Date()
+            });
+        }
+
+        console.log('📡 Emitted top-systems-updated and down-atms-updated events');
+
         console.log(`✅ Notifications sent to all ${allUsers.length} users`);
         console.log("✅ Ticket creation completed successfully!");
 
@@ -952,6 +969,30 @@ exports.updateTicket = async (req, res) => {
                 console.log(`📡 Emitted ticket-assigned: ${oldTicket.assigned_to_email} -> ${updates.assigned_to_email}`);
             }
         }
+
+        // Always emit top systems update when status or new ticket changes
+        io.emit('top-systems-updated', {
+            reason: 'ticket_updated',
+            ticketId: updatedTicket.ticket_sl,
+            timestamp: new Date()
+        });
+
+        // Check if this ticket is an ATM and emit down ATMs update
+        const isAtmTicket = (oldTicket.system_name && oldTicket.system_name.toLowerCase().includes('atm')) ||
+            (updates.system_name && updates.system_name.toLowerCase().includes('atm')) ||
+            (oldTicket.problem_details && oldTicket.problem_details.toLowerCase().includes('atm')) ||
+            (updates.problem_details && updates.problem_details.toLowerCase().includes('atm'));
+
+        if (isAtmTicket || updates.status) {
+            io.emit('down-atms-updated', {
+                reason: 'atm_ticket_updated',
+                ticketId: updatedTicket.ticket_sl,
+                status: updates.status,
+                timestamp: new Date()
+            });
+        }
+
+        console.log('📡 Emitted top-systems-updated and down-atms-updated events from update');
 
         console.log("✅ Ticket updated successfully:", oldTicket.ticket_sl);
         res.json({
@@ -1409,3 +1450,277 @@ exports.bulkImportTickets = async (req, res) => {
         results: results
     });
 };
+
+
+// ============================================
+// GET TOP 10 SYSTEMS (Most tickets)
+// ============================================
+// ============================================
+// GET TOP 10 SYSTEMS (Most tickets with date filter)
+// ============================================
+exports.getTopSystems = async (req, res) => {
+    try {
+        const pool = await poolPromise;
+        const { dateFilter = 'all' } = req.query;
+
+        console.log('📊 Fetching top systems with filter:', dateFilter);
+
+        // Get date range based on filter
+        let dateCondition = '';
+        const params = {};
+
+        if (dateFilter !== 'all') {
+            const now = new Date();
+            let startDate = null;
+            let endDate = null;
+
+            switch (dateFilter) {
+                case 'today':
+                    startDate = new Date(now);
+                    startDate.setHours(0, 0, 0, 0);
+                    endDate = new Date(now);
+                    endDate.setHours(23, 59, 59, 999);
+                    break;
+                case 'yesterday':
+                    startDate = new Date(now);
+                    startDate.setDate(startDate.getDate() - 1);
+                    startDate.setHours(0, 0, 0, 0);
+                    endDate = new Date(startDate);
+                    endDate.setHours(23, 59, 59, 999);
+                    break;
+                case 'week':
+                    startDate = new Date(now);
+                    const day = startDate.getDay();
+                    startDate.setDate(startDate.getDate() - day);
+                    startDate.setHours(0, 0, 0, 0);
+                    break;
+                case 'month':
+                    startDate = new Date(now.getFullYear(), now.getMonth(), 1);
+                    break;
+                case 'quarter':
+                    const quarter = Math.floor(now.getMonth() / 3);
+                    startDate = new Date(now.getFullYear(), quarter * 3, 1);
+                    break;
+                case 'year':
+                    startDate = new Date(now.getFullYear(), 0, 1);
+                    break;
+            }
+
+            if (startDate) {
+                const startDateStr = startDate.toISOString().split('T')[0];
+                dateCondition = `AND date >= '${startDateStr}'`;
+                console.log(`📅 Date filter applied: >= ${startDateStr}`);
+            }
+
+            if (endDate) {
+                const endDateStr = endDate.toISOString().split('T')[0];
+                dateCondition += ` AND date <= '${endDateStr}'`;
+                console.log(`📅 Date filter applied: <= ${endDateStr}`);
+            }
+        }
+
+        // SQL Server query with TOP - Simplified to avoid parameter issues
+        const query = `
+            SELECT TOP 10
+                ISNULL(system_name, 'Unknown') as system_name, 
+                COUNT(*) as ticket_count
+            FROM Tickets
+            WHERE system_name IS NOT NULL 
+                AND system_name != ''
+                AND system_name != 'Unknown'
+                ${dateCondition}
+            GROUP BY system_name
+            ORDER BY ticket_count DESC
+        `;
+
+        console.log('🔍 Executing query:', query);
+
+        const result = await pool.request().query(query);
+
+        console.log(`✅ Found ${result.recordset.length} top systems`);
+        if (result.recordset.length > 0) {
+            console.log('📊 Top systems:', result.recordset);
+        }
+
+        res.json(result.recordset);
+    } catch (error) {
+        console.error('❌ Error fetching top systems:', error);
+        res.status(500).json({ error: 'Internal server error', message: error.message, stack: error.stack });
+    }
+};
+
+// ============================================
+// GET CURRENTLY DOWN ATMs
+// ============================================
+exports.getDownAtms = async (req, res) => {
+    try {
+        const pool = await poolPromise;
+
+        console.log('🏧 Fetching currently down ATMs...');
+
+        const query = `
+            SELECT 
+                t.id,
+                t.ticket_sl,
+                t.system_name,
+                t.branch,
+                t.down_time,
+                t.problem_details,
+                t.status,
+                t.risk_label,
+                t.assigned_to_name,
+                t.reporter_name as reported_by_name,
+                t.affected_user,
+                t.pc_name,
+                u.name as assigned_to_name_from_users
+            FROM Tickets t
+            LEFT JOIN Users u ON t.assigned_to_email = u.email
+            WHERE t.status IN ('open', 'in-progress')
+                AND (t.system_name LIKE '%ATM%' 
+                     OR t.system_name LIKE '%CDM%' 
+                     OR t.system_name LIKE '%Kiosk%'
+                     OR t.problem_details LIKE '%ATM%'
+                     OR t.problem_details LIKE '%CDM%')
+            ORDER BY t.down_time DESC
+        `;
+
+        const result = await pool.request().query(query);
+
+        // Calculate downtime duration for each ATM
+        const downAtms = result.recordset.map(atm => {
+            let downTimeDuration = 'Unknown';
+            let downtimeHours = 0;
+
+            if (atm.down_time) {
+                try {
+                    const downTime = new Date(atm.down_time);
+                    const now = new Date();
+                    const diffMs = now - downTime;
+                    const diffMins = Math.floor(diffMs / 60000);
+                    const diffHours = Math.floor(diffMins / 60);
+                    const diffDays = Math.floor(diffHours / 24);
+
+                    if (diffDays > 0) {
+                        downTimeDuration = `${diffDays}d ${diffHours % 24}h`;
+                    } else if (diffHours > 0) {
+                        downTimeDuration = `${diffHours}h ${diffMins % 60}m`;
+                    } else {
+                        downTimeDuration = `${diffMins}m`;
+                    }
+                    downtimeHours = diffHours;
+                } catch (e) {
+                    console.error('Error calculating downtime:', e);
+                }
+            }
+
+            // Determine risk color
+            let riskColor = 'bg-blue-100 text-blue-700';
+            if (atm.risk_label === 'HIGH') riskColor = 'bg-red-100 text-red-700';
+            else if (atm.risk_label === 'MEDIUM') riskColor = 'bg-orange-100 text-orange-700';
+
+            return {
+                id: atm.id,
+                ticket_sl: atm.ticket_sl,
+                system_name: atm.system_name || 'Unknown ATM',
+                branch: atm.branch || 'Unknown Location',
+                down_time: atm.down_time,
+                down_time_duration: downTimeDuration,
+                downtime_hours: downtimeHours,
+                problem_details: atm.problem_details,
+                status: atm.status,
+                risk_label: atm.risk_label || 'LOW',
+                risk_color: riskColor,
+                assigned_to_name: atm.assigned_to_name_from_users || atm.assigned_to_name || 'Unassigned',
+                reported_by_name: atm.reported_by_name || 'Unknown',
+                affected_user: atm.affected_user,
+                pc_name: atm.pc_name
+            };
+        });
+
+        console.log(`🏧 Found ${downAtms.length} down ATMs`);
+
+        res.json(downAtms);
+    } catch (error) {
+        console.error('Error fetching down ATMs:', error);
+        res.status(500).json({ error: 'Internal server error', message: error.message });
+    }
+};
+
+
+// ============================================
+// EMIT REAL-TIME DASHBOARD UPDATES
+// ============================================
+async function emitRealtimeDashboardUpdates(io) {
+    try {
+        const pool = await poolPromise;
+
+        // Fetch top systems
+        const topSystemsQuery = `
+            SELECT 
+                system_name, 
+                COUNT(*) as ticket_count
+            FROM Tickets
+            WHERE system_name IS NOT NULL AND system_name != ''
+            GROUP BY system_name
+            ORDER BY ticket_count DESC
+            LIMIT 10
+        `;
+        const topSystemsResult = await pool.request().query(topSystemsQuery);
+
+        // Fetch down ATMs
+        const downAtmsQuery = `
+            SELECT 
+                t.id,
+                t.ticket_sl,
+                t.system_name,
+                t.branch,
+                t.down_time,
+                t.problem_details,
+                t.status,
+                t.risk_label,
+                t.assigned_to_name,
+                t.reporter_name as reported_by_name
+            FROM Tickets t
+            WHERE t.status IN ('open', 'in-progress')
+                AND (t.system_name LIKE '%ATM%' 
+                     OR t.system_name LIKE '%CDM%' 
+                     OR t.problem_details LIKE '%ATM%')
+            ORDER BY t.down_time DESC
+            LIMIT 20
+        `;
+        const downAtmsResult = await pool.request().query(downAtmsQuery);
+
+        // Calculate downtime for ATMs
+        const downAtms = downAtmsResult.recordset.map(atm => {
+            let downTimeDuration = 'Unknown';
+            if (atm.down_time) {
+                const downTime = new Date(atm.down_time);
+                const now = new Date();
+                const diffMins = Math.floor((now - downTime) / 60000);
+                const diffHours = Math.floor(diffMins / 60);
+                const diffDays = Math.floor(diffHours / 24);
+
+                if (diffDays > 0) downTimeDuration = `${diffDays}d ${diffHours % 24}h`;
+                else if (diffHours > 0) downTimeDuration = `${diffHours}h ${diffMins % 60}m`;
+                else downTimeDuration = `${diffMins}m`;
+            }
+            return { ...atm, down_time_duration: downTimeDuration };
+        });
+
+        // Emit updates
+        io.emit('top-systems-data', topSystemsResult.recordset);
+        io.emit('down-atms-data', downAtms);
+
+        console.log('📡 Emitted real-time dashboard updates');
+    } catch (error) {
+        console.error('Error emitting real-time updates:', error);
+    }
+}
+
+// You can call this function periodically (every 30 seconds) or on demand
+setInterval(() => {
+    const io = require('../server').io; // You'll need to export io from your server
+    if (io) {
+        emitRealtimeDashboardUpdates(io);
+    }
+}, 30000); // Every 30 seconds
