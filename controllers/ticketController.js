@@ -1465,62 +1465,46 @@ exports.getTopSystems = async (req, res) => {
 
         console.log('📊 Fetching top systems with filter:', dateFilter);
 
-        // Get date range based on filter
+        // Build date condition with parameters
         let dateCondition = '';
-        const params = {};
+        let startDate = null;
+        let endDate = null;
+        const now = new Date();
 
-        if (dateFilter !== 'all') {
-            const now = new Date();
-            let startDate = null;
-            let endDate = null;
-
-            switch (dateFilter) {
-                case 'today':
-                    startDate = new Date(now);
-                    startDate.setHours(0, 0, 0, 0);
-                    endDate = new Date(now);
-                    endDate.setHours(23, 59, 59, 999);
-                    break;
-                case 'yesterday':
-                    startDate = new Date(now);
-                    startDate.setDate(startDate.getDate() - 1);
-                    startDate.setHours(0, 0, 0, 0);
-                    endDate = new Date(startDate);
-                    endDate.setHours(23, 59, 59, 999);
-                    break;
-                case 'week':
-                    startDate = new Date(now);
-                    const day = startDate.getDay();
-                    startDate.setDate(startDate.getDate() - day);
-                    startDate.setHours(0, 0, 0, 0);
-                    break;
-                case 'month':
-                    startDate = new Date(now.getFullYear(), now.getMonth(), 1);
-                    break;
-                case 'quarter':
-                    const quarter = Math.floor(now.getMonth() / 3);
-                    startDate = new Date(now.getFullYear(), quarter * 3, 1);
-                    break;
-                case 'year':
-                    startDate = new Date(now.getFullYear(), 0, 1);
-                    break;
-            }
-
-            if (startDate) {
-                const startDateStr = startDate.toISOString().split('T')[0];
-                dateCondition = `AND date >= '${startDateStr}'`;
-                console.log(`📅 Date filter applied: >= ${startDateStr}`);
-            }
-
-            if (endDate) {
-                const endDateStr = endDate.toISOString().split('T')[0];
-                dateCondition += ` AND date <= '${endDateStr}'`;
-                console.log(`📅 Date filter applied: <= ${endDateStr}`);
-            }
+        switch (dateFilter) {
+            case 'today':
+                startDate = new Date(now);
+                startDate.setHours(0, 0, 0, 0);
+                endDate = new Date(now);
+                endDate.setHours(23, 59, 59, 999);
+                break;
+            case 'yesterday':
+                startDate = new Date(now);
+                startDate.setDate(startDate.getDate() - 1);
+                startDate.setHours(0, 0, 0, 0);
+                endDate = new Date(startDate);
+                endDate.setHours(23, 59, 59, 999);
+                break;
+            case 'week':
+                startDate = new Date(now);
+                const day = startDate.getDay();
+                const diffToMonday = day === 0 ? 6 : day - 1;
+                startDate.setDate(startDate.getDate() - diffToMonday);
+                startDate.setHours(0, 0, 0, 0);
+                break;
+            case 'month':
+                startDate = new Date(now.getFullYear(), now.getMonth(), 1);
+                break;
+            case 'quarter':
+                const quarter = Math.floor(now.getMonth() / 3);
+                startDate = new Date(now.getFullYear(), quarter * 3, 1);
+                break;
+            case 'year':
+                startDate = new Date(now.getFullYear(), 0, 1);
+                break;
         }
 
-        // SQL Server query with TOP - Simplified to avoid parameter issues
-        const query = `
+        let query = `
             SELECT TOP 10
                 ISNULL(system_name, 'Unknown') as system_name, 
                 COUNT(*) as ticket_count
@@ -1528,24 +1512,34 @@ exports.getTopSystems = async (req, res) => {
             WHERE system_name IS NOT NULL 
                 AND system_name != ''
                 AND system_name != 'Unknown'
-                ${dateCondition}
-            GROUP BY system_name
-            ORDER BY ticket_count DESC
         `;
 
-        console.log('🔍 Executing query:', query);
+        const request = pool.request();
 
-        const result = await pool.request().query(query);
+        if (startDate) {
+            query += ` AND date >= @startDate`;
+            request.input('startDate', sql.Date, startDate);
+            console.log(`📅 Date filter applied: >= ${startDate.toISOString().split('T')[0]}`);
+        }
+
+        if (endDate) {
+            query += ` AND date <= @endDate`;
+            request.input('endDate', sql.Date, endDate);
+            console.log(`📅 Date filter applied: <= ${endDate.toISOString().split('T')[0]}`);
+        }
+
+        query += ` GROUP BY system_name ORDER BY ticket_count DESC`;
+
+        console.log('🔍 Executing query with params');
+
+        const result = await request.query(query);
 
         console.log(`✅ Found ${result.recordset.length} top systems`);
-        if (result.recordset.length > 0) {
-            console.log('📊 Top systems:', result.recordset);
-        }
 
         res.json(result.recordset);
     } catch (error) {
         console.error('❌ Error fetching top systems:', error);
-        res.status(500).json({ error: 'Internal server error', message: error.message, stack: error.stack });
+        res.status(500).json({ error: 'Internal server error', message: error.message });
     }
 };
 
