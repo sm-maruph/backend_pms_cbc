@@ -1456,7 +1456,10 @@ exports.bulkImportTickets = async (req, res) => {
 // GET TOP 10 SYSTEMS (Most tickets)
 // ============================================
 // ============================================
-// GET TOP 10 SYSTEMS (Most tickets with date filter)
+// GET TOP SYSTEMS (Using same date logic as dashboard stats)
+// ============================================
+// ============================================
+// GET TOP SYSTEMS
 // ============================================
 exports.getTopSystems = async (req, res) => {
     try {
@@ -1465,84 +1468,169 @@ exports.getTopSystems = async (req, res) => {
 
         console.log('📊 Fetching top systems with filter:', dateFilter);
 
-        // Build date condition with parameters
-        let dateCondition = '';
-        let startDate = null;
-        let endDate = null;
-        const now = new Date();
-
-        switch (dateFilter) {
-            case 'today':
-                startDate = new Date(now);
-                startDate.setHours(0, 0, 0, 0);
-                endDate = new Date(now);
-                endDate.setHours(23, 59, 59, 999);
-                break;
-            case 'yesterday':
-                startDate = new Date(now);
-                startDate.setDate(startDate.getDate() - 1);
-                startDate.setHours(0, 0, 0, 0);
-                endDate = new Date(startDate);
-                endDate.setHours(23, 59, 59, 999);
-                break;
-            case 'week':
-                startDate = new Date(now);
-                const day = startDate.getDay();
-                const diffToMonday = day === 0 ? 6 : day - 1;
-                startDate.setDate(startDate.getDate() - diffToMonday);
-                startDate.setHours(0, 0, 0, 0);
-                break;
-            case 'month':
-                startDate = new Date(now.getFullYear(), now.getMonth(), 1);
-                break;
-            case 'quarter':
-                const quarter = Math.floor(now.getMonth() / 3);
-                startDate = new Date(now.getFullYear(), quarter * 3, 1);
-                break;
-            case 'year':
-                startDate = new Date(now.getFullYear(), 0, 1);
-                break;
-        }
-
-        let query = `
-            SELECT TOP 10
-                ISNULL(system_name, 'Unknown') as system_name, 
-                COUNT(*) as ticket_count
-            FROM Tickets
-            WHERE system_name IS NOT NULL 
+        // ============================================
+        // USE SAME DATE LOGIC AS DASHBOARD STATS
+        // ============================================
+        let whereClause = `
+            WHERE system_name IS NOT NULL
                 AND system_name != ''
                 AND system_name != 'Unknown'
+                AND date IS NOT NULL
         `;
 
+        const params = {};
+
+        // Apply same date filtering logic
+        if (dateFilter !== 'all') {
+            const dateRange = getDateRangeForFilter(dateFilter);
+
+            console.log('🔍 Date range:', dateRange);
+
+            if (dateRange.startDate && dateRange.endDate) {
+                whereClause += `
+                    AND date >= @startDate
+                    AND date <= @endDate
+                `;
+
+                params.startDate = dateRange.startDate;
+                params.endDate = dateRange.endDate;
+
+                console.log('✅ Date WHERE clause added');
+            }
+        }
+
+        console.log('📝 Final WHERE clause:', whereClause);
+
+        // ============================================
+        // CREATE REQUEST WITH PARAMETERS
+        // ============================================
         const request = pool.request();
 
-        if (startDate) {
-            query += ` AND date >= @startDate`;
-            request.input('startDate', sql.Date, startDate);
-            console.log(`📅 Date filter applied: >= ${startDate.toISOString().split('T')[0]}`);
+        if (params.startDate) {
+            request.input('startDate', sql.Date, params.startDate);
         }
 
-        if (endDate) {
-            query += ` AND date <= @endDate`;
-            request.input('endDate', sql.Date, endDate);
-            console.log(`📅 Date filter applied: <= ${endDate.toISOString().split('T')[0]}`);
+        if (params.endDate) {
+            request.input('endDate', sql.Date, params.endDate);
         }
 
-        query += ` GROUP BY system_name ORDER BY ticket_count DESC`;
+        // ============================================
+        // GET TOTAL TICKETS
+        // ============================================
+        const totalCountQuery = `
+            SELECT COUNT(*) as total_tickets
+            FROM Tickets
+            ${whereClause}
+        `;
 
-        console.log('🔍 Executing query with params');
+        const totalResult = await request.query(totalCountQuery);
 
-        const result = await request.query(query);
+        const totalTickets =
+            totalResult.recordset[0]?.total_tickets || 0;
 
-        console.log(`✅ Found ${result.recordset.length} top systems`);
+        console.log(`📊 Total tickets for period: ${totalTickets}`);
 
-        res.json(result.recordset);
+        // ============================================
+        // GET TOP SYSTEMS
+        // ============================================
+        const systemsRequest = pool.request();
+
+        // Add params again for second query
+        if (params.startDate) {
+            systemsRequest.input(
+                'startDate',
+                sql.Date,
+                params.startDate
+            );
+        }
+
+        if (params.endDate) {
+            systemsRequest.input(
+                'endDate',
+                sql.Date,
+                params.endDate
+            );
+        }
+
+        const topSystemsQuery = `
+            SELECT TOP 10
+                system_name,
+                COUNT(*) as ticket_count
+            FROM Tickets
+            ${whereClause}
+            GROUP BY system_name
+            ORDER BY ticket_count DESC
+        `;
+
+        const systemsResult =
+            await systemsRequest.query(topSystemsQuery);
+
+        const topSystems = systemsResult.recordset;
+
+        // ============================================
+        // CALCULATE STATS
+        // ============================================
+        const stats = {
+            totalTickets,
+            uniqueSystems: topSystems.length,
+            topSystemCount:
+                topSystems[0]?.ticket_count || 0,
+            topSystemName:
+                topSystems[0]?.system_name || 'N/A',
+            topSystemPercentage:
+                totalTickets > 0
+                    ? (
+                        ((topSystems[0]?.ticket_count || 0) /
+                            totalTickets) *
+                        100
+                    ).toFixed(1)
+                    : 0
+        };
+
+        // ============================================
+        // ADD PERCENTAGE TO EACH SYSTEM
+        // ============================================
+        const systemsWithPercentage = topSystems.map(system => ({
+            ...system,
+            percentage:
+                totalTickets > 0
+                    ? (
+                        (system.ticket_count / totalTickets) *
+                        100
+                    ).toFixed(1)
+                    : 0
+        }));
+
+        console.log(
+            `✅ Found ${systemsWithPercentage.length} top systems`
+        );
+
+        res.json({
+            success: true,
+            data: {
+                systems: systemsWithPercentage,
+                totalTickets,
+                stats,
+                dateFilter,
+                period: {
+                    startDate: params.startDate || null,
+                    endDate: params.endDate || null
+                }
+            }
+        });
+
     } catch (error) {
-        console.error('❌ Error fetching top systems:', error);
-        res.status(500).json({ error: 'Internal server error', message: error.message });
+        console.error(
+            '❌ Error fetching top systems:',
+            error
+        );
+
+        res.status(500).json({
+            error: 'Internal server error',
+            message: error.message
+        });
     }
 };
-
 // ============================================
 // GET CURRENTLY DOWN ATMs
 // ============================================
