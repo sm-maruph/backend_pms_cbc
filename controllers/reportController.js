@@ -60,9 +60,9 @@ exports.getReportData = async (req, res) => {
                 t.ticket_sl,
                 t.date,
                 t.month,
-                t.reported_by_email,
+                t.reported_by_id,
                 reporter.name as reportedByName,
-                t.assigned_to_email,
+                t.assigned_to_id,
                 assignee.name as assigned_to_name,
                 t.affected_user,
                 t.system_name,
@@ -83,8 +83,8 @@ exports.getReportData = async (req, res) => {
                 t.updated_at,
                 t.reporter_name
             FROM Tickets t
-            LEFT JOIN Users reporter ON t.reported_by_email = reporter.email
-            LEFT JOIN Users assignee ON t.assigned_to_email = assignee.email
+            LEFT JOIN Users reporter ON t.reported_by_id = reporter.id
+            LEFT JOIN Users assignee ON t.assigned_to_id = assignee.id
             WHERE 1=1
             ${dateFilter}
             ORDER BY t.created_at DESC

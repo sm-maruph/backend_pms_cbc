@@ -1,5 +1,17 @@
 const { poolPromise, sql } = require('../config/db');
 const { saveNotification } = require('./notificationController');
+const AuditLog = require('../models/AuditLog');
+
+
+// Helper to get client IP
+const getClientIp = (req) => {
+    return req.headers['x-forwarded-for'] ||
+        req.connection.remoteAddress ||
+        req.socket.remoteAddress ||
+        req.ip ||
+        'unknown';
+};
+
 
 // Helper to get ALL users (both admin and regular users)
 async function getAllUsers() {
@@ -8,6 +20,48 @@ async function getAllUsers() {
     return result.recordset;
 }
 
+// Helper to get user ID by email
+async function getUserIdByEmail(email) {
+    if (!email) return null;
+    const pool = await poolPromise;
+    const result = await pool.request()
+        .input('email', sql.NVarChar, email)
+        .query("SELECT id FROM Users WHERE email = @email");
+    return result.recordset[0]?.id || null;
+}
+
+// Helper to get user email by ID
+async function getUserEmailById(id) {
+    if (!id) return null;
+    const pool = await poolPromise;
+    const result = await pool.request()
+        .input('id', sql.Int, id)
+        .query("SELECT email, name FROM Users WHERE id = @id");
+    return result.recordset[0] || null;
+}
+
+
+// Add this function to track changes
+async function logTicketAction(actionType, entityId, oldData, newData, req, changes = null) {
+    const ip_address = getClientIp(req);
+
+    await AuditLog.create({
+        action_type: actionType,
+        entity_type: 'TICKET',
+        entity_id: entityId,
+        old_value: oldData ? JSON.stringify(oldData) : null,
+        new_value: newData ? JSON.stringify(newData) : null,
+        changes: changes ? JSON.stringify(changes) : null,
+        user_id: req.user.id,
+        user_email: req.user.email,
+        user_name: req.user.name,
+        user_role: req.user.role,
+        ip_address: ip_address,
+        user_agent: req.headers['user-agent']
+    });
+
+    console.log(`📝 Audit logged: ${actionType} on TICKET #${entityId} by ${req.user.email} from IP: ${ip_address}`);
+}
 
 exports.getAllTickets = async (req, res) => {
     try {
@@ -15,11 +69,13 @@ exports.getAllTickets = async (req, res) => {
         const result = await pool.request().query(`
             SELECT 
                 t.*, 
-                u.name as reportedByName,
-                assigned_user.name as assignedToName
+                COALESCE(u.name, t.reporter_name) as reportedByName,
+                COALESCE(assigned_user.name, t.assigned_to_name) as assignedToName,
+                u.email as reported_by_email,
+                assigned_user.email as assigned_to_email
             FROM Tickets t
-            LEFT JOIN Users u ON t.reported_by_email = u.email
-            LEFT JOIN Users assigned_user ON t.assigned_to_email = assigned_user.email
+            LEFT JOIN Users u ON t.reported_by_id = u.id
+            LEFT JOIN Users assigned_user ON t.assigned_to_id = assigned_user.id
             ORDER BY t.created_at DESC
         `);
         res.json(result.recordset);
@@ -33,17 +89,23 @@ exports.getMyTickets = async (req, res) => {
     const userEmail = req.user.email;
     try {
         const pool = await poolPromise;
+
+        // First get user ID
+        const userId = await getUserIdByEmail(userEmail);
+
         const result = await pool.request()
-            .input('email', sql.NVarChar, userEmail)
+            .input('userId', sql.Int, userId)
             .query(`
                 SELECT 
                     t.*, 
-                    u.name as reportedByName,
-                    assigned_user.name as assignedToName
+                    COALESCE(u.name, t.reporter_name) as reportedByName,
+                    COALESCE(assigned_user.name, t.assigned_to_name) as assignedToName,
+                    u.email as reported_by_email,
+                    assigned_user.email as assigned_to_email
                 FROM Tickets t
-                LEFT JOIN Users u ON t.reported_by_email = u.email
-                LEFT JOIN Users assigned_user ON t.assigned_to_email = assigned_user.email
-                WHERE t.reported_by_email = @email OR t.assigned_to_email = @email
+                LEFT JOIN Users u ON t.reported_by_id = u.id
+                LEFT JOIN Users assigned_user ON t.assigned_to_id = assigned_user.id
+                WHERE t.reported_by_id = @userId OR t.assigned_to_id = @userId
                 ORDER BY t.created_at DESC
             `);
         res.json(result.recordset);
@@ -82,19 +144,20 @@ exports.getPaginatedTickets = async (req, res) => {
             params.status = status;
         }
 
-        // Search filter
+        // Search filter - UPDATED to use ID-based joins
         if (search) {
             whereClause += ` AND (
                 t.system_name LIKE @search OR 
                 t.problem_details LIKE @search OR 
                 t.affected_user LIKE @search OR
                 u.name LIKE @search OR
+                assigned_user.name LIKE @search OR
                 t.ticket_sl LIKE @search
             )`;
             params.search = `%${search}%`;
         }
 
-        // Date filter - Using same logic as frontend (based on date field)
+        // Date filter
         if (dateFilter !== 'all') {
             const dateRange = getDateRangeForFilter(dateFilter);
             console.log('🔍 DATE FILTER DEBUG:');
@@ -107,11 +170,7 @@ exports.getPaginatedTickets = async (req, res) => {
                 params.startDate = dateRange.startDate;
                 params.endDate = dateRange.endDate;
                 console.log('  - WHERE clause added with date range');
-            } else {
-                console.log('  - No date range applied - check getDateRangeForFilter');
             }
-        } else {
-            console.log('  - Date filter is "all" - no date filter applied');
         }
 
         // Build ORDER BY
@@ -136,9 +195,8 @@ exports.getPaginatedTickets = async (req, res) => {
                 orderBy = 'ORDER BY t.created_at DESC';
         }
 
-        // Get total count
+        // Get total count - UPDATED to use ID-based joins
         const countRequest = pool.request();
-        // ✅ ADD THIS - Add parameters to countRequest
         if (params.status) {
             countRequest.input('status', sql.NVarChar, params.status);
         }
@@ -151,16 +209,18 @@ exports.getPaginatedTickets = async (req, res) => {
         if (params.endDate) {
             countRequest.input('endDate', sql.Date, params.endDate);
         }
+
         const countResult = await countRequest.query(`
             SELECT COUNT(*) as total
             FROM Tickets t
-            LEFT JOIN Users u ON t.reported_by_email = u.email
+            LEFT JOIN Users u ON t.reported_by_id = u.id
+            LEFT JOIN Users assigned_user ON t.assigned_to_id = assigned_user.id
             ${whereClause}
         `);
 
         const totalCount = countResult.recordset[0].total;
 
-        // Get paginated data
+        // Get paginated data - UPDATED to use ID-based joins
         const dataRequest = pool.request();
         for (const [key, value] of Object.entries(params)) {
             if (key === 'startDate' || key === 'endDate') {
@@ -175,11 +235,13 @@ exports.getPaginatedTickets = async (req, res) => {
         const result = await dataRequest.query(`
             SELECT 
                 t.*, 
-                u.name as reportedByName,
-                assigned_user.name as assignedToName
+                COALESCE(u.name, t.reporter_name) as reportedByName,
+                COALESCE(assigned_user.name, t.assigned_to_name) as assignedToName,
+                u.email as reported_by_email,
+                assigned_user.email as assigned_to_email
             FROM Tickets t
-            LEFT JOIN Users u ON t.reported_by_email = u.email
-            LEFT JOIN Users assigned_user ON t.assigned_to_email = assigned_user.email
+            LEFT JOIN Users u ON t.reported_by_id = u.id
+            LEFT JOIN Users assigned_user ON t.assigned_to_id = assigned_user.id
             ${whereClause}
             ${orderBy}
             OFFSET @offset ROWS
@@ -203,6 +265,7 @@ exports.getPaginatedTickets = async (req, res) => {
         res.status(500).json({ message: 'Error fetching tickets', error: err.message });
     }
 };
+
 
 // ============================================
 // GET DASHBOARD STATS (For charts and cards)
@@ -403,6 +466,181 @@ function getDateRangeForFilter(dateFilter) {
 
     return { startDate: formattedStartDate, endDate: formattedEndDate };
 }
+
+
+
+// ============================================
+// AUDIT HELPER FUNCTIONS FOR HUMAN-READABLE FORMAT
+// ============================================
+
+// Format date for human readability
+const formatDateForAudit = (dateValue) => {
+    if (!dateValue) return 'Not set';
+    try {
+        const date = new Date(dateValue);
+        if (isNaN(date.getTime())) return String(dateValue);
+        return date.toLocaleString('en-US', {
+            year: 'numeric',
+            month: 'short',
+            day: 'numeric',
+            hour: '2-digit',
+            minute: '2-digit',
+            hour12: true
+        });
+    } catch (e) {
+        return String(dateValue);
+    }
+};
+
+// Format any value for audit display
+const formatValueForAudit = (value) => {
+    if (value === null || value === undefined || value === '') return 'Not set';
+    if (typeof value === 'string' && (value.includes('T') || value.includes('Z'))) {
+        return formatDateForAudit(value);
+    }
+    if (value instanceof Date) {
+        return formatDateForAudit(value);
+    }
+    return String(value);
+};
+
+// Get readable status action description
+const getStatusActionDescription = (oldStatus, newStatus) => {
+    if (newStatus === 'open' && oldStatus === 'in-progress') {
+        return { action: 'reopened', text: 'reopened the ticket' };
+    }
+    if (newStatus === 'open' && oldStatus === 'resolved') {
+        return { action: 'reopened from resolved', text: 'reopened the resolved ticket' };
+    }
+    if (newStatus === 'in-progress') {
+        return { action: 'started working on', text: 'started working on the ticket' };
+    }
+    if (newStatus === 'resolved') {
+        return { action: 'resolved', text: 'resolved the ticket' };
+    }
+    return { 
+        action: `changed status from ${oldStatus} to ${newStatus}`, 
+        text: `changed status from ${oldStatus} to ${newStatus}`
+    };
+};
+
+// Get readable field name
+const getReadableFieldName = (field) => {
+    const fieldMap = {
+        'system_name': 'System',
+        'problem_details': 'Problem Details',
+        'department': 'Department',
+        'branch': 'Branch',
+        'risk_label': 'Risk Level',
+        'affected_user': 'Affected User',
+        'assigned_to_name': 'Assigned To',
+        'pc_name': 'PC Name',
+        'down_time': 'Down Time',
+        'up_time': 'Up Time',
+        'status': 'Status',
+        'root_cause': 'Root Cause',
+        'resolution': 'Resolution',
+        'remarks_by_admin': 'Admin Remarks'
+    };
+    return fieldMap[field] || field.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
+};
+
+// Updated logTicketAction with human-readable formatting
+async function logTicketAction(actionType, entityId, oldData, newData, req, customData = null) {
+    const ip_address = getClientIp(req);
+    
+    // Create human-readable change description
+    let humanReadableChanges = {};
+    let changeSummary = '';
+    let fullDescription = '';
+    
+    if (customData && customData.changes && Object.keys(customData.changes).length > 0) {
+        const changeDescriptions = [];
+        
+        for (const [key, change] of Object.entries(customData.changes)) {
+            // Format old and new values
+            const oldVal = formatValueForAudit(change.old);
+            const newVal = formatValueForAudit(change.new);
+            
+            humanReadableChanges[key] = {
+                old: oldVal,
+                new: newVal
+            };
+            
+            // Create a human-readable sentence for this change
+            if (key === 'status' && change.action) {
+                changeDescriptions.push(change.action);
+            } else if (key === 'assigned_to') {
+                changeDescriptions.push(`assigned to ${newVal}`);
+            } else if (key === 'Risk Level') {
+                changeDescriptions.push(`risk changed from ${oldVal} to ${newVal}`);
+            } else if (key === 'Down Time') {
+                changeDescriptions.push(`down time set to ${newVal}`);
+            } else if (key === 'Up Time') {
+                changeDescriptions.push(`up time set to ${newVal}`);
+            } else {
+                changeDescriptions.push(`${key.toLowerCase()} changed from "${oldVal}" to "${newVal}"`);
+            }
+        }
+        
+        changeSummary = changeDescriptions.join(', ');
+        fullDescription = `${req.user.name} ${actionType.toLowerCase()}d ticket ${entityId}: ${changeSummary}`;
+    } else if (actionType === 'CREATE') {
+        fullDescription = `${req.user.name} created ticket ${entityId}`;
+        changeSummary = 'Ticket created';
+    } else if (actionType === 'DELETE') {
+        fullDescription = `${req.user.name} deleted ticket ${entityId}`;
+        changeSummary = 'Ticket deleted';
+    }
+    
+    // Format old and new values for the entire object
+    let formattedOldValue = null;
+    let formattedNewValue = null;
+    
+    if (oldData) {
+        const formattedOld = {};
+        for (const [key, value] of Object.entries(oldData)) {
+            formattedOld[getReadableFieldName(key)] = formatValueForAudit(value);
+        }
+        formattedOldValue = JSON.stringify(formattedOld, null, 2);
+    }
+    
+    if (newData) {
+        const formattedNew = {};
+        for (const [key, value] of Object.entries(newData)) {
+            formattedNew[getReadableFieldName(key)] = formatValueForAudit(value);
+        }
+        formattedNewValue = JSON.stringify(formattedNew, null, 2);
+    }
+    
+    // Store everything in the changes field
+    const finalChanges = {
+        summary: changeSummary,
+        full_description: fullDescription,
+        details: humanReadableChanges,
+        timestamp: new Date().toISOString(),
+        user: req.user.name,
+        action: actionType
+    };
+    
+    await AuditLog.create({
+        action_type: actionType,
+        entity_type: 'TICKET',
+        entity_id: entityId,
+        old_value: formattedOldValue,
+        new_value: formattedNewValue,
+        changes: JSON.stringify(finalChanges, null, 2),
+        user_id: req.user.id,
+        user_email: req.user.email,
+        user_name: req.user.name,
+        user_role: req.user.role,
+        ip_address: ip_address,
+        user_agent: req.headers['user-agent']
+    });
+
+    console.log(`📝 Audit logged: ${fullDescription}`);
+}
+
 exports.createTicket = async (req, res) => {
     console.log("📥 ========== CREATE TICKET REQUEST ==========");
     console.log("📦 Request body:", JSON.stringify(req.body, null, 2));
@@ -422,7 +660,6 @@ exports.createTicket = async (req, res) => {
         downTime
     } = req.body;
 
-    // Check for missing required fields
     const missingFields = [];
     if (!systemName) missingFields.push('systemName');
     if (!problemDetails) missingFields.push('problemDetails');
@@ -438,13 +675,23 @@ exports.createTicket = async (req, res) => {
         });
     }
 
-    console.log("✅ All required fields present");
-
     const reportedByEmail = req.user.email;
     const reporterName = req.user.name;
 
     try {
         const pool = await poolPromise;
+
+        // Get reporter user ID
+        const reporterId = await getUserIdByEmail(reportedByEmail);
+        if (!reporterId) {
+            return res.status(400).json({ message: 'Reporter user not found' });
+        }
+
+        // Get assignee user ID if provided
+        let assignedToId = null;
+        if (assignedToEmail) {
+            assignedToId = await getUserIdByEmail(assignedToEmail);
+        }
 
         // Convert downTime to SQL compatible format
         let formattedDownTime = null;
@@ -485,11 +732,25 @@ exports.createTicket = async (req, res) => {
         const ticket_sl = ticketSLResult.recordset[0]?.ticket_sl;
         console.log("✅ Generated ticket_sl:", ticket_sl);
 
-        // Use values from frontend
-        const finalAssignedToEmail = assignedToEmail || null;
         const finalAssignedToName = assignedToName || 'Unassigned';
 
-        console.log("📝 Inserting ticket...");
+        // Prepare new ticket data for audit
+        const newTicketData = {
+            ticket_sl: ticket_sl,
+            system_name: systemName,
+            problem_details: problemDetails,
+            department: department,
+            branch: branch,
+            risk_label: riskLabel || 'MEDIUM',
+            affected_user: affectedUser,
+            assigned_to_email: assignedToEmail || null,
+            assigned_to_name: finalAssignedToName,
+            status: 'open',
+            reporter_name: reporterName,
+            reported_by_email: reportedByEmail
+        };
+
+        // Insert ticket with IDs
         await pool.request()
             .input('ticket_sl', sql.NVarChar, ticket_sl)
             .input('date', sql.Date, date || new Date())
@@ -500,57 +761,36 @@ exports.createTicket = async (req, res) => {
             .input('branch', sql.NVarChar, branch)
             .input('riskLabel', sql.NVarChar, riskLabel || 'MEDIUM')
             .input('affectedUser', sql.NVarChar, affectedUser)
-            .input('assignedToEmail', sql.NVarChar, finalAssignedToEmail)
+            .input('assignedToId', sql.Int, assignedToId)
             .input('assignedToName', sql.NVarChar, finalAssignedToName)
             .input('pcName', sql.NVarChar, pcName || null)
             .input('downTime', sql.DateTime, formattedDownTime || new Date())
-            .input('reportedByEmail', sql.NVarChar, reportedByEmail)
+            .input('reportedById', sql.Int, reporterId)
             .input('reporterName', sql.NVarChar, reporterName)
             .query(`
                 INSERT INTO Tickets (
                     ticket_sl, date, month, system_name, problem_details, 
                     department, branch, risk_label, affected_user, 
-                    assigned_to_email, assigned_to_name, pc_name, down_time, 
-                    reported_by_email, reporter_name, status, created_at, updated_at
+                    assigned_to_id, assigned_to_name, pc_name, down_time, 
+                    reported_by_id, reporter_name, status, created_at, updated_at
                 )
                 VALUES (
                     @ticket_sl, @date, @month, @systemName, @problemDetails,
                     @department, @branch, @riskLabel, @affectedUser,
-                    @assignedToEmail, @assignedToName, @pcName, @downTime,
-                    @reportedByEmail, @reporterName, 'open', GETDATE(), GETDATE()
+                    @assignedToId, @assignedToName, @pcName, @downTime,
+                    @reportedById, @reporterName, 'open', GETDATE(), GETDATE()
                 )
             `);
 
         console.log("✅ Ticket inserted successfully:", ticket_sl);
 
-        // ============================================================
-        // 🔔 SEND NOTIFICATIONS TO ALL USERS
-        // ============================================================
-        const getAllUsers = async () => {
-            const result = await pool.request().query("SELECT email, name, role FROM Users");
-            return result.recordset;
-        };
+        // ✅ AUDIT LOG: Ticket creation (now newTicketData is defined)
+        await logTicketAction('CREATE', ticket_sl, null, newTicketData, req, {
+            created: newTicketData,
+            details: `${req.user.name} created ticket ${ticket_sl} for system: ${systemName}`
+        });
 
-        const saveNotification = async (userEmail, notification, ticket_sl = null, metadata = null) => {
-            try {
-                await pool.request()
-                    .input('user_email', sql.NVarChar, userEmail)
-                    .input('type', sql.NVarChar, notification.type)
-                    .input('title', sql.NVarChar, notification.title)
-                    .input('message', sql.NVarChar, notification.message)
-                    .input('ticket_sl', sql.NVarChar, ticket_sl)
-                    .input('metadata', sql.NVarChar, metadata ? JSON.stringify(metadata) : null)
-                    .query(`
-                        INSERT INTO Notifications (user_email, type, title, message, ticket_sl, metadata, created_at)
-                        VALUES (@user_email, @type, @title, @message, @ticket_sl, @metadata, GETDATE())
-                    `);
-                return true;
-            } catch (err) {
-                console.error('Failed to save notification:', err);
-                return false;
-            }
-        };
-
+        // Send notifications (keep existing notification logic but use email for lookup)
         const allUsers = await getAllUsers();
         console.log(`📢 Sending notifications to ${allUsers.length} users...`);
 
@@ -575,15 +815,10 @@ exports.createTicket = async (req, res) => {
                     created_at: new Date().toISOString(),
                     is_read: 0
                 });
-                console.log(`✅ Real-time notification sent to ${user.email}`);
             }
         }
 
-        // ============================================================
-        // 🚀 EMIT REAL-TIME TICKET UPDATES (ADD THIS SECTION)
-        // ============================================================
         if (io) {
-            // Emit to all connected clients that a new ticket was created
             io.emit('ticket-created', {
                 ticket: {
                     ticket_sl: ticket_sl,
@@ -595,35 +830,8 @@ exports.createTicket = async (req, res) => {
                 },
                 message: `New ticket ${ticket_sl} created by ${reporterName}`
             });
-            console.log('📡 Emitted ticket-created event to all clients');
-
-            // Also emit stats update
-            io.emit('stats-updated', {
-                reason: 'new_ticket',
-                timestamp: new Date()
-            });
-            console.log('📡 Emitted stats-updated event to all clients');
+            io.emit('stats-updated', { reason: 'new_ticket', timestamp: new Date() });
         }
-
-        // Emit top systems update
-        io.emit('top-systems-updated', {
-            reason: 'new_ticket',
-            timestamp: new Date()
-        });
-
-        // Check if this ticket is an ATM and emit down ATMs update
-        if (systemName && (systemName.toLowerCase().includes('atm') ||
-            problemDetails.toLowerCase().includes('atm'))) {
-            io.emit('down-atms-updated', {
-                reason: 'new_atm_ticket',
-                timestamp: new Date()
-            });
-        }
-
-        console.log('📡 Emitted top-systems-updated and down-atms-updated events');
-
-        console.log(`✅ Notifications sent to all ${allUsers.length} users`);
-        console.log("✅ Ticket creation completed successfully!");
 
         res.status(201).json({
             message: 'Ticket created successfully',
@@ -637,21 +845,20 @@ exports.createTicket = async (req, res) => {
         res.status(500).json({ message: 'Error creating ticket', error: err.message });
     }
 };
-
 exports.updateTicket = async (req, res) => {
     const { id } = req.params;
     const updates = req.body;
+    const ip_address = getClientIp(req);
 
     console.log("📥 Update request for ticket:", id);
     console.log("📦 Update data:", updates);
     console.log("👤 Updated by:", req.user?.email);
 
-    // Update allowed fields to include new schema fields
     const allowed = [
         'status', 'assigned_to_name', 'assigned_to_email', 'up_time',
         'root_cause', 'resolution', 'remarks', 'remarks_by_admin',
         'risk_label', 'system_name', 'department', 'branch',
-        'affected_user', 'pc_name', 'down_time', 'problem_details'
+        'affected_user', 'pc_name', 'down_time', 'problem_details', 'assigned_to_id'
     ];
 
     const setClause = [];
@@ -659,17 +866,19 @@ exports.updateTicket = async (req, res) => {
     const request = pool.request();
     request.input('id', sql.Int, id);
 
-    // FIRST: Get the old ticket data for comparison and notifications
+    // Get old ticket data with IDs
     const oldTicketResult = await pool.request()
         .input('id', sql.Int, id)
         .query(`
             SELECT 
-                t.*, 
+                t.*,
                 u.name as reportedByName,
-                assigned_user.name as assignedToName
+                u.email as reported_by_email,
+                assigned_user.name as assignedToName,
+                assigned_user.email as assigned_to_email
             FROM Tickets t
-            LEFT JOIN Users u ON t.reported_by_email = u.email
-            LEFT JOIN Users assigned_user ON t.assigned_to_email = assigned_user.email
+            LEFT JOIN Users u ON t.reported_by_id = u.id
+            LEFT JOIN Users assigned_user ON t.assigned_to_id = assigned_user.id
             WHERE t.id = @id
         `);
 
@@ -683,17 +892,75 @@ exports.updateTicket = async (req, res) => {
         id: oldTicket.id,
         ticket_sl: oldTicket.ticket_sl,
         status: oldTicket.status,
-        assigned_to_email: oldTicket.assigned_to_email,
+        assigned_to_id: oldTicket.assigned_to_id,
         risk_label: oldTicket.risk_label
     });
 
+    // Track changes for audit
+    const changes = {};
+    let newTicketData = { ...oldTicket };
+
+    // Helper function to check if value is actually changed (ignoring null/empty string differences)
+    const hasChanged = (oldVal, newVal) => {
+        const normalize = (val) => {
+            if (val === null || val === undefined || val === '') return null;
+            return val;
+        };
+        return normalize(oldVal) !== normalize(newVal);
+    };
+
     for (let field of allowed) {
         if (updates[field] !== undefined) {
-            // Handle date fields specially
-            if (field === 'up_time' || field === 'down_time') {
+            if (field === 'assigned_to_email' && updates[field]) {
+                // Convert email to ID
+                const userId = await getUserIdByEmail(updates[field]);
+                if (userId) {
+                    setClause.push('assigned_to_id = @assigned_to_id');
+                    request.input('assigned_to_id', sql.Int, userId);
+
+                    const userInfo = await getUserEmailById(userId);
+                    if (userInfo) {
+                        setClause.push('assigned_to_name = @assigned_to_name');
+                        request.input('assigned_to_name', sql.NVarChar, userInfo.name);
+
+                        if (hasChanged(oldTicket.assigned_to_name, userInfo.name)) {
+                            changes['assigned_to'] = {
+                                old: oldTicket.assigned_to_name || 'Unassigned',
+                                new: userInfo.name
+                            };
+                            newTicketData.assigned_to_name = userInfo.name;
+                            newTicketData.assigned_to_email = updates[field];
+                        }
+                    }
+                }
+            } else if (field === 'status') {
+                setClause.push('status = @status');
+                request.input('status', sql.NVarChar, updates[field]);
+
+                if (hasChanged(oldTicket.status, updates[field])) {
+                    let actionDescription = '';
+                    if (updates[field] === 'open' && oldTicket.status === 'in-progress') {
+                        actionDescription = 'reopened';
+                    } else if (updates[field] === 'open' && oldTicket.status === 'resolved') {
+                        actionDescription = 'reopened from resolved';
+                    } else if (updates[field] === 'in-progress') {
+                        actionDescription = 'started working on';
+                    } else if (updates[field] === 'resolved') {
+                        actionDescription = 'resolved';
+                    } else {
+                        actionDescription = `changed status from ${oldTicket.status} to ${updates[field]}`;
+                    }
+
+                    changes['status'] = {
+                        old: oldTicket.status || 'Not set',
+                        new: updates[field],
+                        action: actionDescription
+                    };
+                    newTicketData.status = updates[field];
+                }
+            } else if (field === 'up_time' || field === 'down_time') {
                 let dateValue = updates[field];
                 if (dateValue) {
-                    // Try to convert to valid Date object
                     const parsedDate = new Date(dateValue);
                     if (!isNaN(parsedDate.getTime())) {
                         dateValue = parsedDate;
@@ -703,33 +970,60 @@ exports.updateTicket = async (req, res) => {
                 }
                 setClause.push(`${field} = @${field}`);
                 request.input(field, sql.DateTime, dateValue || null);
-            } else {
+
+                const oldValue = oldTicket[field];
+                const newValue = dateValue;
+                if (hasChanged(oldValue, newValue)) {
+                    const fieldDisplay = field === 'up_time' ? 'Up Time' : 'Down Time';
+                    changes[fieldDisplay] = {
+                        old: oldValue ? new Date(oldValue).toLocaleString() : 'Not set',
+                        new: newValue ? new Date(newValue).toLocaleString() : 'Not set'
+                    };
+                    newTicketData[field] = dateValue;
+                }
+            } else if (field === 'risk_label') {
                 setClause.push(`${field} = @${field}`);
                 request.input(field, sql.NVarChar, updates[field]);
+
+                if (hasChanged(oldTicket[field], updates[field])) {
+                    changes['Risk Level'] = {
+                        old: oldTicket[field] || 'Not set',
+                        new: updates[field]
+                    };
+                    newTicketData[field] = updates[field];
+                }
+            } else if (field === 'assigned_to_id') {
+                continue;
+            } else if (field !== 'assigned_to_email') {
+                setClause.push(`${field} = @${field}`);
+                request.input(field, sql.NVarChar, updates[field]);
+
+                // Only log if value actually changed (ignore null vs empty string)
+                if (hasChanged(oldTicket[field], updates[field])) {
+                    const fieldDisplay = field.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
+                    changes[fieldDisplay] = {
+                        old: oldTicket[field] || 'Not set',
+                        new: updates[field] || 'Not set'
+                    };
+                    newTicketData[field] = updates[field];
+                }
             }
         }
     }
 
-    // If assigned_to_email is updated, also update assigned_to_name
-    let newAssigneeName = null;
-    if (updates.assigned_to_email) {
-        const userResult = await pool.request()
-            .input('email', sql.NVarChar, updates.assigned_to_email)
-            .query('SELECT name FROM Users WHERE email = @email');
-
-        if (userResult.recordset[0]) {
-            newAssigneeName = userResult.recordset[0].name;
-            request.input('assigned_to_name', sql.NVarChar, newAssigneeName);
-            setClause.push('assigned_to_name = @assigned_to_name');
-        }
-    }
-
-    // Handle resolved status with proper date
+    // Handle resolution without up_time
     if (updates.status === 'resolved' && !updates.up_time) {
         const now = new Date();
         request.input('up_time', sql.DateTime, now);
         setClause.push('up_time = @up_time');
-        console.log("🕐 Setting up_time to:", now);
+
+        if (hasChanged(oldTicket.up_time, now)) {
+            changes['Up Time'] = {
+                old: oldTicket.up_time ? new Date(oldTicket.up_time).toLocaleString() : 'Not set',
+                new: now.toLocaleString()
+            };
+            newTicketData.up_time = now;
+        }
     }
 
     if (setClause.length === 0) {
@@ -743,61 +1037,62 @@ exports.updateTicket = async (req, res) => {
         console.log("📝 Update query:", query);
         await request.query(query);
 
-        // ============================================================
-        // FETCH UPDATED TICKET DATA
-        // ============================================================
+        // Get updated ticket
         const updatedTicketResult = await pool.request()
             .input('id', sql.Int, id)
             .query(`
                 SELECT 
-                    t.*, 
-                    u.name as reportedByName,
-                    assigned_user.name as assignedToName
+                    t.*,
+                    COALESCE(u.name, t.reporter_name) as reportedByName,
+                    COALESCE(assigned_user.name, t.assigned_to_name) as assignedToName,
+                    u.email as reported_by_email,
+                    assigned_user.email as assigned_to_email
                 FROM Tickets t
-                LEFT JOIN Users u ON t.reported_by_email = u.email
-                LEFT JOIN Users assigned_user ON t.assigned_to_email = assigned_user.email
+                LEFT JOIN Users u ON t.reported_by_id = u.id
+                LEFT JOIN Users assigned_user ON t.assigned_to_id = assigned_user.id
                 WHERE t.id = @id
             `);
 
         const updatedTicket = updatedTicketResult.recordset[0];
+        newTicketData = { ...newTicketData, ...updatedTicket };
 
-        // ============================================================
-        // SEND NOTIFICATIONS FOR CHANGES
-        // ============================================================
+        // ✅ Create change summary (FIX: define changeSummary here)
+        let changeSummary = 'No significant changes';
+        if (Object.keys(changes).length > 0) {
+            changeSummary = Object.keys(changes).map(key => {
+                if (key === 'status' && changes[key].action) {
+                    return `${changes[key].action}`;
+                }
+                return `${key}: from "${changes[key].old}" to "${changes[key].new}"`;
+            }).join(', ');
+        }
+
+        // ✅ AUDIT LOG: Ticket update
+        if (Object.keys(changes).length > 0) {
+            await logTicketAction('UPDATE', oldTicket.ticket_sl, oldTicket, newTicketData, req, {
+                changes: changes,
+                summary: changeSummary,
+                details: `${req.user.name} updated ticket ${oldTicket.ticket_sl}: ${changeSummary}`,
+                ip: ip_address
+            });
+
+            console.log(`📝 Audit: Ticket ${oldTicket.ticket_sl} updated - Changes: ${changeSummary}`);
+        } else {
+            console.log(`📝 No significant changes detected for ticket ${oldTicket.ticket_sl}`);
+        }
+
+        // Send notifications (keep existing logic)
         const io = req.app.get('io');
         const connectedUsers = req.app.get('connectedUsers');
-
-        // Helper function to save notification
-        const saveNotification = async (userEmail, notification, ticket_sl = null, metadata = null) => {
-            try {
-                await pool.request()
-                    .input('user_email', sql.NVarChar, userEmail)
-                    .input('type', sql.NVarChar, notification.type)
-                    .input('title', sql.NVarChar, notification.title)
-                    .input('message', sql.NVarChar, notification.message)
-                    .input('ticket_sl', sql.NVarChar, ticket_sl)
-                    .input('metadata', sql.NVarChar, metadata ? JSON.stringify(metadata) : null)
-                    .query(`
-                        INSERT INTO Notifications (user_email, type, title, message, ticket_sl, metadata, created_at)
-                        VALUES (@user_email, @type, @title, @message, @ticket_sl, @metadata, GETDATE())
-                    `);
-                return true;
-            } catch (err) {
-                console.error('Failed to save notification:', err);
-                return false;
-            }
-        };
-
         const updatedBy = req.user?.name || req.user?.email || 'System';
 
-        // 1. STATUS CHANGE NOTIFICATION
+        // Status change notification
         if (updates.status && oldTicket.status !== updates.status) {
             const statusMessages = {
                 'open': 'reopened',
                 'in-progress': 'started working on',
                 'resolved': 'resolved'
             };
-
             const action = statusMessages[updates.status] || `changed status to ${updates.status}`;
             const statusNotification = {
                 type: 'status_change',
@@ -805,7 +1100,6 @@ exports.updateTicket = async (req, res) => {
                 message: `${updatedBy} ${action} ticket ${oldTicket.ticket_sl}`
             };
 
-            // Notify reporter and assignee
             const usersToNotify = [oldTicket.reported_by_email];
             if (oldTicket.assigned_to_email && oldTicket.assigned_to_email !== oldTicket.reported_by_email) {
                 usersToNotify.push(oldTicket.assigned_to_email);
@@ -813,192 +1107,49 @@ exports.updateTicket = async (req, res) => {
 
             for (const userEmail of usersToNotify) {
                 if (userEmail && userEmail !== req.user?.email) {
-                    await saveNotification(userEmail, statusNotification, oldTicket.ticket_sl, {
-                        oldStatus: oldTicket.status,
-                        newStatus: updates.status,
-                        updatedBy: updatedBy
-                    });
-
+                    await saveNotification(userEmail, statusNotification, oldTicket.ticket_sl);
                     const socketId = connectedUsers?.get(userEmail);
                     if (socketId && io) {
-                        io.to(socketId).emit('notification', {
-                            ...statusNotification,
-                            id: oldTicket.ticket_sl,
-                            created_at: new Date().toISOString(),
-                            is_read: 0,
-                            ticket_sl: oldTicket.ticket_sl
-                        });
+                        io.to(socketId).emit('notification', statusNotification);
                     }
                 }
             }
         }
 
-        // 2. ASSIGNMENT CHANGE NOTIFICATION
+        // Assignment change notification
         if (updates.assigned_to_email && oldTicket.assigned_to_email !== updates.assigned_to_email) {
+            const newAssigneeInfo = await getUserEmailById(await getUserIdByEmail(updates.assigned_to_email));
             const assignmentNotification = {
                 type: 'assignment',
                 title: `📌 Ticket Assigned`,
-                message: `${updatedBy} assigned ticket ${oldTicket.ticket_sl} to ${newAssigneeName || updates.assigned_to_email}`
+                message: `${updatedBy} assigned ticket ${oldTicket.ticket_sl} to ${newAssigneeInfo?.name || updates.assigned_to_email}`
             };
 
-            // Notify new assignee
-            await saveNotification(updates.assigned_to_email, assignmentNotification, oldTicket.ticket_sl, {
-                assignedBy: updatedBy,
-                ticketTitle: oldTicket.system_name
-            });
-
+            await saveNotification(updates.assigned_to_email, assignmentNotification, oldTicket.ticket_sl);
             const newAssigneeSocketId = connectedUsers?.get(updates.assigned_to_email);
             if (newAssigneeSocketId && io) {
-                io.to(newAssigneeSocketId).emit('notification', {
-                    ...assignmentNotification,
-                    id: oldTicket.ticket_sl,
-                    created_at: new Date().toISOString(),
-                    is_read: 0,
-                    ticket_sl: oldTicket.ticket_sl
-                });
-            }
-
-            // Also notify reporter that ticket was assigned
-            if (oldTicket.reported_by_email && oldTicket.reported_by_email !== updates.assigned_to_email) {
-                const reporterNotification = {
-                    type: 'assignment_update',
-                    title: `📌 Ticket Assignment Update`,
-                    message: `Ticket ${oldTicket.ticket_sl} has been assigned to ${newAssigneeName || updates.assigned_to_email}`
-                };
-
-                await saveNotification(oldTicket.reported_by_email, reporterNotification, oldTicket.ticket_sl);
-
-                const reporterSocketId = connectedUsers?.get(oldTicket.reported_by_email);
-                if (reporterSocketId && io) {
-                    io.to(reporterSocketId).emit('notification', reporterNotification);
-                }
+                io.to(newAssigneeSocketId).emit('notification', assignmentNotification);
             }
         }
-
-        // 3. RISK LEVEL CHANGE NOTIFICATION
-        if (updates.risk_label && oldTicket.risk_label !== updates.risk_label) {
-            const riskNotification = {
-                type: 'risk_change',
-                title: `⚠️ Risk Level Changed`,
-                message: `${updatedBy} changed risk level of ticket ${oldTicket.ticket_sl} from ${oldTicket.risk_label} to ${updates.risk_label}`
-            };
-
-            const usersToNotify = [oldTicket.reported_by_email];
-            if (oldTicket.assigned_to_email && oldTicket.assigned_to_email !== oldTicket.reported_by_email) {
-                usersToNotify.push(oldTicket.assigned_to_email);
-            }
-
-            for (const userEmail of usersToNotify) {
-                if (userEmail && userEmail !== req.user?.email) {
-                    await saveNotification(userEmail, riskNotification, oldTicket.ticket_sl);
-
-                    const socketId = connectedUsers?.get(userEmail);
-                    if (socketId && io) {
-                        io.to(socketId).emit('notification', riskNotification);
-                    }
-                }
-            }
-        }
-
-        // ============================================================
-        // EMIT REAL-TIME SOCKET EVENTS
-        // ============================================================
 
         if (io) {
-            // Emit to all clients that a ticket was updated
             io.emit('ticket-updated', {
                 ticket: updatedTicket,
                 changes: updates,
-                oldData: {
-                    status: oldTicket.status,
-                    assigned_to_email: oldTicket.assigned_to_email,
-                    risk_label: oldTicket.risk_label
-                },
                 updatedBy: updatedBy,
                 timestamp: new Date()
             });
-            console.log('📡 Emitted ticket-updated event to all clients');
 
-            // Emit to specific ticket room (for users viewing this ticket)
-            io.to(`ticket_${id}`).emit('ticket-detail-updated', {
-                ticket: updatedTicket,
-                changes: updates,
-                updatedBy: updatedBy,
-                timestamp: new Date()
-            });
-            console.log(`📡 Emitted ticket-detail-updated to room ticket_${id}`);
-
-            // Emit stats update if status or risk changed
             if (updates.status || updates.risk_label) {
-                io.emit('stats-updated', {
-                    reason: 'ticket_updated',
-                    ticketId: updatedTicket.ticket_sl,
-                    changes: {
-                        status: updates.status,
-                        risk: updates.risk_label
-                    },
-                    timestamp: new Date()
-                });
-                console.log('📡 Emitted stats-updated event to all clients');
-            }
-
-            // Emit specific event for status changes
-            if (updates.status && oldTicket.status !== updates.status) {
-                io.emit('ticket-status-changed', {
-                    ticketId: updatedTicket.ticket_sl,
-                    ticketSl: oldTicket.ticket_sl,
-                    oldStatus: oldTicket.status,
-                    newStatus: updates.status,
-                    updatedBy: updatedBy,
-                    timestamp: new Date()
-                });
-                console.log(`📡 Emitted ticket-status-changed: ${oldTicket.status} -> ${updates.status}`);
-            }
-
-            // Emit specific event for assignment changes
-            if (updates.assigned_to_email && oldTicket.assigned_to_email !== updates.assigned_to_email) {
-                io.emit('ticket-assigned', {
-                    ticketId: updatedTicket.ticket_sl,
-                    ticketSl: oldTicket.ticket_sl,
-                    oldAssignee: oldTicket.assigned_to_email,
-                    newAssignee: updates.assigned_to_email,
-                    newAssigneeName: newAssigneeName,
-                    assignedBy: updatedBy,
-                    timestamp: new Date()
-                });
-                console.log(`📡 Emitted ticket-assigned: ${oldTicket.assigned_to_email} -> ${updates.assigned_to_email}`);
+                io.emit('stats-updated', { reason: 'ticket_updated', timestamp: new Date() });
             }
         }
 
-        // Always emit top systems update when status or new ticket changes
-        io.emit('top-systems-updated', {
-            reason: 'ticket_updated',
-            ticketId: updatedTicket.ticket_sl,
-            timestamp: new Date()
-        });
-
-        // Check if this ticket is an ATM and emit down ATMs update
-        const isAtmTicket = (oldTicket.system_name && oldTicket.system_name.toLowerCase().includes('atm')) ||
-            (updates.system_name && updates.system_name.toLowerCase().includes('atm')) ||
-            (oldTicket.problem_details && oldTicket.problem_details.toLowerCase().includes('atm')) ||
-            (updates.problem_details && updates.problem_details.toLowerCase().includes('atm'));
-
-        if (isAtmTicket || updates.status) {
-            io.emit('down-atms-updated', {
-                reason: 'atm_ticket_updated',
-                ticketId: updatedTicket.ticket_sl,
-                status: updates.status,
-                timestamp: new Date()
-            });
-        }
-
-        console.log('📡 Emitted top-systems-updated and down-atms-updated events from update');
-
-        console.log("✅ Ticket updated successfully:", oldTicket.ticket_sl);
         res.json({
             message: 'Ticket updated successfully',
             ticket: updatedTicket,
-            changes: updates
+            changes: updates,
+            audit_summary: changeSummary
         });
 
     } catch (err) {
@@ -1006,17 +1157,93 @@ exports.updateTicket = async (req, res) => {
         res.status(500).json({ message: 'Update failed', error: err.message });
     }
 };
+
 exports.deleteTicket = async (req, res) => {
     const { id } = req.params;
+    const ip_address = getClientIp(req);
+
     try {
         const pool = await poolPromise;
-        await pool.request().input('id', sql.Int, id).query('DELETE FROM Tickets WHERE id = @id');
-        res.json({ message: 'Ticket deleted successfully' });
+
+        // Get ticket data before deletion for audit
+        const ticketResult = await pool.request()
+            .input('id', sql.Int, id)
+            .query(`
+                SELECT 
+                    t.*,
+                    u.name as reportedByName,
+                    u.email as reported_by_email,
+                    assigned_user.name as assignedToName,
+                    assigned_user.email as assigned_to_email
+                FROM Tickets t
+                LEFT JOIN Users u ON t.reported_by_id = u.id
+                LEFT JOIN Users assigned_user ON t.assigned_to_id = assigned_user.id
+                WHERE t.id = @id
+            `);
+
+        if (ticketResult.recordset.length === 0) {
+            return res.status(404).json({ message: 'Ticket not found' });
+        }
+
+        const ticketToDelete = ticketResult.recordset[0];
+
+        // ✅ AUDIT LOG: Ticket deletion
+        await logTicketAction('DELETE', ticketToDelete.ticket_sl, ticketToDelete, null, req, {
+            deleted: {
+                ticket_sl: ticketToDelete.ticket_sl,
+                system_name: ticketToDelete.system_name,
+                problem_details: ticketToDelete.problem_details,
+                status: ticketToDelete.status
+            },
+            details: `${req.user.name} deleted ticket ${ticketToDelete.ticket_sl}`,
+            ip: ip_address
+        });
+
+        // Delete the ticket
+        await pool.request()
+            .input('id', sql.Int, id)
+            .query('DELETE FROM Tickets WHERE id = @id');
+
+        console.log(`✅ Ticket deleted: ${ticketToDelete.ticket_sl} by ${req.user.email} from IP: ${ip_address}`);
+
+        // Emit socket event
+        const io = req.app.get('io');
+        if (io) {
+            io.emit('ticket-deleted', {
+                ticket_sl: ticketToDelete.ticket_sl,
+                deletedBy: req.user.name,
+                timestamp: new Date()
+            });
+            io.emit('stats-updated', { reason: 'ticket_deleted', timestamp: new Date() });
+        }
+
+        res.json({
+            success: true,
+            message: 'Ticket deleted successfully',
+            deletedTicket: {
+                ticket_sl: ticketToDelete.ticket_sl,
+                system_name: ticketToDelete.system_name
+            }
+        });
+
     } catch (err) {
-        console.error(err);
-        res.status(500).json({ message: 'Delete failed' });
+        console.error('Delete error:', err);
+        res.status(500).json({ message: 'Delete failed', error: err.message });
     }
 };
+
+
+// exports.deleteTicket = async (req, res) => {
+//     const { id } = req.params;
+//     try {
+//         const pool = await poolPromise;
+//         await pool.request().input('id', sql.Int, id).query('DELETE FROM Tickets WHERE id = @id');
+//         res.json({ message: 'Ticket deleted successfully' });
+//     } catch (err) {
+//         console.error(err);
+//         res.status(500).json({ message: 'Delete failed' });
+//     }
+// };
 
 // Additional helper function to get ticket by ticket_sl
 exports.getTicketBySL = async (req, res) => {
@@ -1028,11 +1255,13 @@ exports.getTicketBySL = async (req, res) => {
             .query(`
                 SELECT 
                     t.*, 
-                    u.name as reportedByName,
-                    assigned_user.name as assignedToName
+                    COALESCE(u.name, t.reporter_name) as reportedByName,
+                    COALESCE(assigned_user.name, t.assigned_to_name) as assignedToName,
+                    u.email as reported_by_email,
+                    assigned_user.email as assigned_to_email
                 FROM Tickets t
-                LEFT JOIN Users u ON t.reported_by_email = u.email
-                LEFT JOIN Users assigned_user ON t.assigned_to_email = assigned_user.email
+                LEFT JOIN Users u ON t.reported_by_id = u.id
+                LEFT JOIN Users assigned_user ON t.assigned_to_id = assigned_user.id
                 WHERE t.ticket_sl = @ticket_sl
             `);
 
@@ -1046,6 +1275,7 @@ exports.getTicketBySL = async (req, res) => {
         res.status(500).json({ message: 'Error fetching ticket' });
     }
 };
+
 
 // Open: backend/controllers/ticketController.js
 // Add this function at the end of the file (before module.exports)
@@ -1656,7 +1886,7 @@ exports.getDownAtms = async (req, res) => {
                 t.pc_name,
                 u.name as assigned_to_name_from_users
             FROM Tickets t
-            LEFT JOIN Users u ON t.assigned_to_email = u.email
+            LEFT JOIN Users u ON t.assigned_to_id = u.id
             WHERE t.status IN ('open', 'in-progress')
                 AND (t.system_name LIKE '%ATM%' 
                      OR t.system_name LIKE '%CDM%' 

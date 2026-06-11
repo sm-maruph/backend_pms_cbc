@@ -1,16 +1,28 @@
 const { body, validationResult } = require('express-validator');
 
 const validateLogin = [
-    body('email').isEmail().withMessage('Valid email is required'),
-    body('password').notEmpty().withMessage('Password is required'),
+    body('employee_id')
+        .notEmpty()
+        .withMessage('Employee ID is required'),
+
+    body('password')
+        .notEmpty()
+        .withMessage('Password is required'),
+
     (req, res, next) => {
         const errors = validationResult(req);
+
         if (!errors.isEmpty()) {
-            return res.status(400).json({ errors: errors.array() });
+            return res.status(400).json({
+                success: false,
+                errors: errors.array()
+            });
         }
+
         next();
     }
 ];
+
 
 const validateTicket = [
     // Required fields (only problemDetails is truly required)
@@ -22,7 +34,7 @@ const validateTicket = [
     body('branch').optional({ nullable: true, checkFalsy: true }).trim(),
     body('affectedUser').optional({ nullable: true, checkFalsy: true }).trim(),
     body('pcName').optional({ nullable: true, checkFalsy: true }).trim(),
-    
+
     // Allow null, empty string, or valid email
     body('assignedToEmail')
         .optional({ nullable: true, checkFalsy: true })
@@ -31,7 +43,7 @@ const validateTicket = [
             return /^\S+@\S+\.\S+$/.test(value);
         })
         .withMessage('Invalid email format for assignment'),
-    
+
     body('assignedToName').optional({ nullable: true, checkFalsy: true }).trim(),
 
     // Risk label with default

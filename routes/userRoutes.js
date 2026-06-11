@@ -1,12 +1,13 @@
 const express = require('express');
 const router = express.Router();
 const auth = require('../middleware/auth');
-const { 
-    getAllUsers,      
-    getBasicUsers,    
-    createUser, 
-    updateUser, 
-    deleteUser 
+const {
+    getAllUsers,
+    getBasicUsers,
+    createUser,
+    updateUser,
+    deleteUser,
+    getUserActivityStats
 } = require('../controllers/userController');
 
 const isAdmin = (req, res, next) => {
@@ -26,5 +27,6 @@ router.get('/', auth, isAdmin, getAllUsers);
 router.post('/', auth, isAdmin, createUser);
 router.put('/:id', auth, isAdmin, updateUser);
 router.delete('/:id', auth, isAdmin, deleteUser);
+router.get('/activity-stats', auth, isAdmin, getUserActivityStats);
 
 module.exports = router;

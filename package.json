@@ -8,6 +8,7 @@
     "dev": "nodemon server.js"
   },
   "dependencies": {
+    "activedirectory2": "^2.2.0",
     "bcrypt": "^6.0.0",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
@@ -16,6 +17,7 @@
     "express-validator": "^7.3.2",
     "helmet": "^8.1.0",
     "jsonwebtoken": "^9.0.3",
+    "ldapjs": "^3.0.7",
     "mssql": "^12.5.2",
     "socket.io": "^4.8.3"
   },
