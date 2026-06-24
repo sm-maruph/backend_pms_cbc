@@ -15,64 +15,87 @@ const getUserIdByEmail = async (email) => {
     }
 };
 
-// Get user's notifications (UPDATED to use user_id)
+// Get user's notifications (paginated)
 exports.getUserNotifications = async (req, res) => {
     const userEmail = req.user.email;
-    const { limit = 50, offset = 0 } = req.query;
-    
+
+    // Accept either page-based or offset-based params
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const pageSize = Math.min(100, Math.max(1, parseInt(req.query.limit || req.query.pageSize) || 50));
+    const offset = req.query.offset !== undefined
+        ? Math.max(0, parseInt(req.query.offset) || 0)
+        : (page - 1) * pageSize;
+
     try {
         const pool = await poolPromise;
-        
-        // Get user ID from email
+
         const userId = await getUserIdByEmail(userEmail);
         if (!userId) {
             return res.status(404).json({ message: 'User not found' });
         }
-        
+
+        // 1. Total count for this user
+        const countResult = await pool.request()
+            .input('user_id', sql.Int, userId)
+            .query('SELECT COUNT(*) AS total FROM Notifications WHERE user_id = @user_id');
+        const totalCount = countResult.recordset[0].total;
+
+        // 2. Page of notifications
         const result = await pool.request()
             .input('user_id', sql.Int, userId)
-            .input('limit', sql.Int, parseInt(limit))
-            .input('offset', sql.Int, parseInt(offset))
+            .input('offset', sql.Int, offset)
+            .input('pageSize', sql.Int, pageSize)
             .query(`
-                SELECT id, type, title, message, ticket_sl, is_read, 
-                       CONVERT(NVARCHAR(50), created_at, 127) as created_at, metadata
+                SELECT id, type, title, message, ticket_sl, is_read,
+                       created_at, metadata
                 FROM Notifications
                 WHERE user_id = @user_id
                 ORDER BY created_at DESC
                 OFFSET @offset ROWS
-                FETCH NEXT @limit ROWS ONLY
+                FETCH NEXT @pageSize ROWS ONLY
             `);
-        
-        // Format dates as ISO UTC
-        const formattedResults = result.recordset.map(record => ({
+
+        const data = result.recordset.map(record => ({
             ...record,
             created_at: record.created_at ? new Date(record.created_at).toISOString() : null
         }));
-        
-        res.json(formattedResults);
+
+        const totalPages = Math.ceil(totalCount / pageSize);
+        const currentPage = Math.floor(offset / pageSize) + 1;
+
+        res.json({
+            data,
+            pagination: {
+                currentPage,
+                pageSize,
+                totalCount,
+                totalPages,
+                hasNext: offset + pageSize < totalCount,
+                hasPrev: offset > 0
+            }
+        });
     } catch (err) {
         console.error('Error fetching notifications:', err);
         res.status(500).json({ message: 'Error fetching notifications', error: err.message });
     }
 };
-
 // Get unread count (UPDATED to use user_id)
 exports.getUnreadCount = async (req, res) => {
     const userEmail = req.user.email;
-    
+
     try {
         const pool = await poolPromise;
-        
+
         // Get user ID from email
         const userId = await getUserIdByEmail(userEmail);
         if (!userId) {
             return res.status(404).json({ message: 'User not found' });
         }
-        
+
         const result = await pool.request()
             .input('user_id', sql.Int, userId)
             .query('SELECT COUNT(*) as count FROM Notifications WHERE user_id = @user_id AND is_read = 0');
-        
+
         res.json({ count: result.recordset[0].count });
     } catch (err) {
         console.error('Error fetching unread count:', err);
@@ -87,18 +110,18 @@ exports.markAsRead = async (req, res) => {
 
     try {
         const pool = await poolPromise;
-        
+
         // Get user ID from email
         const userId = await getUserIdByEmail(userEmail);
         if (!userId) {
             return res.status(404).json({ message: 'User not found' });
         }
-        
+
         await pool.request()
             .input('id', sql.Int, id)
             .input('user_id', sql.Int, userId)
             .query('UPDATE Notifications SET is_read = 1 WHERE id = @id AND user_id = @user_id');
-        
+
         res.json({ message: 'Notification marked as read' });
     } catch (err) {
         console.error('Error marking notification as read:', err);
@@ -112,17 +135,17 @@ exports.markAllAsRead = async (req, res) => {
 
     try {
         const pool = await poolPromise;
-        
+
         // Get user ID from email
         const userId = await getUserIdByEmail(userEmail);
         if (!userId) {
             return res.status(404).json({ message: 'User not found' });
         }
-        
+
         await pool.request()
             .input('user_id', sql.Int, userId)
             .query('UPDATE Notifications SET is_read = 1 WHERE user_id = @user_id AND is_read = 0');
-        
+
         res.json({ message: 'All notifications marked as read' });
     } catch (err) {
         console.error('Error marking all as read:', err);
@@ -134,14 +157,14 @@ exports.markAllAsRead = async (req, res) => {
 const saveNotification = async (userEmail, notification, ticket_sl = null, metadata = null) => {
     try {
         const pool = await poolPromise;
-        
+
         // Get user ID from email
         const userId = await getUserIdByEmail(userEmail);
         if (!userId) {
             console.error('User not found:', userEmail);
             return false;
         }
-        
+
         await pool.request()
             .input('user_id', sql.Int, userId)
             .input('type', sql.NVarChar, notification.type)

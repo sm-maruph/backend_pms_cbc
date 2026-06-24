@@ -9,7 +9,11 @@ const LDAPService = require('../services/ldapService');
 router.post('/login', validateLogin, login);
 router.post('/logout', authenticateToken, logout);
 
-
+// Add this to authRoutes.js
+router.post('/ping', authenticateToken, async (req, res) => {
+    // Just to reset activity timer on server side
+    res.json({ success: true, message: 'Activity recorded' });
+});
 
 // Temporary AD test route
 router.post("/ad-test", async (req, res) => {

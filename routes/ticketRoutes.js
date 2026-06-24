@@ -1,86 +1,79 @@
-const express = require('express');
-const router = express.Router();
-const auth = require('../middleware/auth');
-const {
-    getAllTickets,
-    getMyTickets,
-    createTicket,
-    updateTicket,
-    deleteTicket,
-    getTicketBySL,
-    validateBulkTickets,
-    bulkImportTickets,
-    getPaginatedTickets,    // ✅ Add this - paginated tickets
-    getDashboardStats,      // ✅ Add this - dashboard statistics
-    getTopSystems,      // ✅ Add this
-    getDownAtms 
-} = require('../controllers/ticketController');
+// routes/ticketRoutes.js
+const express    = require('express');
+const router     = express.Router();
+const auth       = require('../middleware/auth');
+const admin      = require('../middleware/admin');
 const { validateTicket } = require('../middleware/validation');
-
-// ✅ Simple admin check middleware
+ 
+const {
+  getAllTickets, getMyTickets, createTicket, updateTicket, deleteTicket,
+  getTicketBySL, validateBulkTickets, bulkImportTickets,
+  getPaginatedTickets, getDashboardStats, getTopSystems, getDownAtms,
+} = require('../controllers/ticketController');
+ 
+// ── Safe import of permissions middleware ─────────────────────────────────────
+let requirePermission, requireAnyPermission, attachPermissions;
+try {
+  const perms = require('../middleware/permissions');
+  requirePermission    = typeof perms.requirePermission    === 'function' ? perms.requirePermission    : null;
+  requireAnyPermission = typeof perms.requireAnyPermission === 'function' ? perms.requireAnyPermission : null;
+  attachPermissions    = typeof perms.attachPermissions    === 'function' ? perms.attachPermissions    : null;
+} catch (e) {
+  console.warn('⚠️  permissions middleware not loaded in ticketRoutes:', e.message);
+}
+ 
+const perm    = (p)     => requirePermission    ? requirePermission(p)        : admin;
+const permAny = (...ps) => requireAnyPermission ? requireAnyPermission(...ps) : auth;
+const attach  = attachPermissions || ((req, res, next) => next());
+ 
+// Fallback adminOnly matching your original logic
 const adminOnly = (req, res, next) => {
-    if (req.user && req.user.role === 'admin') {
-        next();
-    } else {
-        res.status(403).json({ message: 'Access denied. Admin only.' });
-    }
+  const adminRoles = ['Super Admin', 'Admin', 'admin'];
+  if (req.user && adminRoles.includes(req.user.role)) return next();
+  return res.status(403).json({ message: 'Access denied. Admin only.' });
 };
-
-// Apply authentication to all routes
+ 
+// ── Apply auth to all routes ──────────────────────────────────────────────────
 router.use(auth);
-
-// ============================================
-// DASHBOARD & PAGINATION ROUTES (NEW)
-// ============================================
-
-// Get dashboard statistics (for charts and cards)
-// This should be before the /:id route to avoid conflicts
-router.get('/stats', getDashboardStats);
-
-// Get paginated tickets with filters (for table)
-router.get('/paginated', getPaginatedTickets);
-
-// ============================================
-// EXISTING ROUTES
-// ============================================
-
-// Get all tickets (admin only or all users - depends on your requirement)
-router.get('/', getAllTickets);
-
-// Get my tickets (reported by or assigned to current user)
-router.get('/my', getMyTickets);
-
-// Get ticket by SL (moved before /:id to avoid conflicts)
-router.get('/sl/:ticket_sl', getTicketBySL);
-
-router.get('/dashboard/top-systems', getTopSystems);
-router.get('/dashboard/down-atms', getDownAtms);
-
-// ============================================
-// BULK IMPORT ROUTES
-// ============================================
-router.post('/bulk-import/validate', adminOnly, validateBulkTickets);
-router.post('/bulk-import', adminOnly, bulkImportTickets);
-
-// ============================================
-// CRUD OPERATIONS
-// ============================================
-
-// Create new ticket
-router.post('/', (req, res, next) => {
-    console.log("🔵 POST /api/tickets - Request received");
-    console.log("🔵 Headers:", req.headers);
-    console.log("🔵 Body:", req.body);
+router.use(attach);
+ 
+// ── Dashboard / Stats  (before /:id to avoid param conflict) ─────────────────
+router.get('/stats',                    perm('dashboard.view'),                                           getDashboardStats);
+router.get('/paginated',                permAny('ticket.view.all','ticket.view.branch','ticket.view.own'), getPaginatedTickets);
+router.get('/dashboard/top-systems',    perm('dashboard.view'),                                           getTopSystems);
+router.get('/dashboard/down-atms',      perm('dashboard.view'),                                           getDownAtms);
+ 
+// ── Fixed paths  (before /:id) ────────────────────────────────────────────────
+router.get('/my',                       getMyTickets);
+router.get('/sl/:ticket_sl',            permAny('ticket.view.all','ticket.view.branch','ticket.view.own'), getTicketBySL);
+ 
+// ── Bulk import  (before /:id) ────────────────────────────────────────────────
+router.post('/bulk-import/validate',    permAny('ticket.create'), validateBulkTickets);
+router.post('/bulk-import',             permAny('ticket.create'), bulkImportTickets);
+ 
+// ── All tickets ───────────────────────────────────────────────────────────────
+router.get('/',
+  permAny('ticket.view.all', 'ticket.view.branch', 'ticket.view.own'),
+  getAllTickets
+);
+ 
+// Create — keep your original debug logging + validation
+router.post('/',
+  perm('ticket.create'),
+  (req, res, next) => {
+    console.log('🔵 POST /api/tickets - Request received');
+    console.log('🔵 Body:', req.body);
     next();
-}, validateTicket, (req, res, next) => {
-    console.log("🟢 Validation passed");
-    next();
-}, createTicket);
-
-// Update ticket by ID
-router.put('/:id', updateTicket);
-
-// Delete ticket by ID (admin only)
-router.delete('/:id', adminOnly, deleteTicket);
-
+  },
+  validateTicket,
+  (req, res, next) => { console.log('🟢 Validation passed'); next(); },
+  createTicket
+);
+ 
+// ── Specific ticket by ID  (LAST — catches /:id) ──────────────────────────────
+router.get('/:id',    permAny('ticket.view.all','ticket.view.branch','ticket.view.own'), getTicketBySL);
+router.put('/:id',    permAny('ticket.edit','ticket.edit.own'),                          updateTicket);
+router.delete('/:id', permAny('ticket.delete','ticket.delete.own'),                     deleteTicket);
+ 
 module.exports = router;
+ 

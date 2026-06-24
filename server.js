@@ -6,6 +6,8 @@ const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const http = require('http');
 const socketIo = require('socket.io');
+const { trackTokenExpiry } = require('./middleware/tokenExpiry');
+const { trackActivity, checkInactivity } = require('./middleware/activityTracker');
 
 const authRoutes = require('./routes/authRoutes');
 const ticketRoutes = require('./routes/ticketRoutes');
@@ -16,6 +18,7 @@ const staticRoutes = require('./routes/staticRoutes');
 const notificationRoutes = require('./routes/notificationRoutes');
 const announcementRoutes = require('./routes/announcementRoutes');
 const auditRoutes = require('./routes/auditRoutes');
+const permissionRoutes = require('./routes/permissionRoutes');
 
 
 const { poolPromise } = require('./config/db');
@@ -156,7 +159,7 @@ app.use(helmet({
 // ======================================================
 
 app.use((req, res, next) => {
-    console.log(`🌍 ${req.method} ${req.url} - Origin: ${req.headers.origin || 'unknown'}`);
+    // console.log(`🌍 ${req.method} ${req.url} - Origin: ${req.headers.origin || 'unknown'}`);
     next();
 });
 
@@ -164,7 +167,7 @@ app.use((req, res, next) => {
 // JSON Parser
 // ======================================================
 
-app.use(express.json({ limit: '100mb' }));
+app.use(express.json({ limit: '1000mb' }));
 
 // ======================================================
 // Rate Limiter
@@ -172,7 +175,7 @@ app.use(express.json({ limit: '100mb' }));
 
 const limiter = rateLimit({
     windowMs: 15 * 60 * 1000,
-    max: 5000,
+    max: 500000,
     standardHeaders: true,
     legacyHeaders: false
 });
@@ -183,6 +186,8 @@ app.use('/api/', limiter);
 // Routes
 // ======================================================
 
+// Add this with your other app.use statements
+app.use('/api/', trackTokenExpiry);
 app.use('/api/auth', authRoutes);
 app.use('/api/tickets', ticketRoutes);
 app.use('/api/stats', statsRoutes);
@@ -192,6 +197,19 @@ app.use('/api/static', staticRoutes);
 app.use('/api/notifications', notificationRoutes);
 app.use('/api/announcements', announcementRoutes);
 app.use('/api/audit', auditRoutes);
+app.use('/api', permissionRoutes);
+
+// Add activity tracking for all authenticated routes
+app.use('/api/', (req, res, next) => {
+    // Skip tracking for login and public endpoints
+    if (req.path === '/api/auth/login' || req.path === '/api/auth/logout') {
+        return next();
+    }
+    next();
+});
+// Apply activity tracking to all authenticated routes
+app.use('/api/', trackActivity);
+app.use('/api/', checkInactivity);
 
 
 // ======================================================

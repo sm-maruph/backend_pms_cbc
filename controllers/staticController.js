@@ -34,6 +34,8 @@ exports.createSystem = async (req, res) => {
     try {
         const { name } = req.body;
         const ip_address = getClientIp(req);
+        const currentTime = new Date(); // ← Get current time (matches down_time approach)
+
 
         if (!name) {
             return res.status(400).json({ message: 'System name is required' });
@@ -56,7 +58,7 @@ exports.createSystem = async (req, res) => {
             .query(`
                 INSERT INTO systems (name, created_at)
                 OUTPUT INSERTED.id, INSERTED.name, INSERTED.created_at
-                VALUES (@name, GETUTCDATE())
+                VALUES (@name, GETDATE())
             `);
 
         const newSystem = result.recordset[0];
@@ -295,7 +297,7 @@ exports.createDepartment = async (req, res) => {
             .query(`
                 INSERT INTO departments (name, created_at)
                 OUTPUT INSERTED.id, INSERTED.name, INSERTED.created_at
-                VALUES (@name, GETUTCDATE())
+                VALUES (@name, GETDATE())
             `);
 
         const newDepartment = result.recordset[0];
@@ -540,7 +542,7 @@ exports.createBranch = async (req, res) => {
             .query(`
                 INSERT INTO branches (name, created_at)
                 OUTPUT INSERTED.id, INSERTED.name, INSERTED.created_at
-                VALUES (@name, GETUTCDATE())
+                VALUES (@name, GETDATE())
             `);
 
         const newBranch = result.recordset[0];

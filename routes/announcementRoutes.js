@@ -9,18 +9,19 @@ const {
     deleteAnnouncement,
     toggleAnnouncementStatus,
 } = require('../controllers/announcementController');
-const authenticateToken = require('../middleware/auth'); // Your existing middleware
+const authenticateToken = require('../middleware/auth');
 
-// Middleware to check if user is admin
+// Admin check — match the actual role names from the roles table
 const isAdmin = (req, res, next) => {
-    if (req.user && req.user.role === 'admin') {
-        next();
-    } else {
-        res.status(403).json({ 
-            success: false, 
-            message: 'Access denied. Admin rights required.' 
-        });
+    const role = req.user?.role;
+    if (role === 'Admin' || role === 'Super Admin') {
+        return next();
     }
+    return res.status(403).json({
+        success: false,
+        message: 'Access denied. Admin rights required.',
+        your_role: role,
+    });
 };
 
 // User routes (any authenticated user can view active announcements)

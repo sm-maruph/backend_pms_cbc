@@ -3,6 +3,56 @@ const { saveNotification } = require('./notificationController');
 const AuditLog = require('../models/AuditLog');
 
 
+const NOTIFY_SCOPE = {
+    'Super Admin': 'all',
+    'Admin': 'all',
+    'IT User': 'all',
+    'IT Member': 'all',
+    'Read Only User': 'all',
+    'Branch Admin': 'branch',
+    'Department Head': 'department',
+    'Branch User': 'own',
+    'Department User': 'own',
+};
+
+// Returns an array of emails that should be notified about a ticket.
+async function getNotificationRecipients(ticket) {
+    const pool = await poolPromise;
+    const usersResult = await pool.request().query(`
+        SELECT u.id, u.email, u.branch, u.department, r.name AS role_name
+        FROM Users u
+        LEFT JOIN roles r ON u.role_id = r.id
+    `);
+
+    const norm = (s) => (s || '').trim().toLowerCase();
+    const tBranch = norm(ticket.branch);
+    const tDept = norm(ticket.department);
+
+    const recipients = new Set();
+
+    for (const u of usersResult.recordset) {
+        const strategy = NOTIFY_SCOPE[u.role_name] || 'own';
+
+        if (strategy === 'all') {
+            if (u.email) recipients.add(u.email);
+        } else if (strategy === 'branch') {
+            if (tBranch && norm(u.branch) === tBranch && u.email) recipients.add(u.email);
+        } else if (strategy === 'department') {
+            if (tDept && norm(u.department) === tDept && u.email) recipients.add(u.email);
+        }
+
+        // 'own' rule — owner & assignee always get it, matched by ID (no email column needed)
+        if (ticket.reported_by_id && u.id === ticket.reported_by_id && u.email) recipients.add(u.email);
+        if (ticket.assigned_to_id && u.id === ticket.assigned_to_id && u.email) recipients.add(u.email);
+    }
+
+    // Fallback: if a caller already has the emails on hand, honor them too
+    if (ticket.reported_by_email) recipients.add(ticket.reported_by_email);
+    if (ticket.assigned_to_email) recipients.add(ticket.assigned_to_email);
+
+    return [...recipients];
+}
+
 // Helper to get client IP
 const getClientIp = (req) => {
     return req.headers['x-forwarded-for'] ||
@@ -119,6 +169,90 @@ exports.getMyTickets = async (req, res) => {
 // ============================================
 // GET PAGINATED TICKETS (For table with filters)
 // ============================================
+// ── Role → ticket visibility strategy ────────────────────────────────────────
+// 'all'        → no restriction
+// 'branch'     → tickets in the user's branch (plus ones they reported/are assigned)
+// 'department' → tickets in the user's department (plus their own)
+// 'own'        → only tickets they reported or are assigned to
+// Unknown/new roles default to 'own' (least privilege) until added here.
+const TICKET_SCOPE_STRATEGY = {
+    'Super Admin': 'all',
+    'Admin': 'all',
+    'IT User': 'all',
+    'IT Member': 'all',
+    'Read Only User': 'all',     // read-only is enforced by permissions, not visibility
+    'Branch Admin': 'branch',
+    'Department Head': 'department',
+    'Branch User': 'own',
+    // 👉 add future roles here, e.g. 'Regional Manager': 'branch'
+};
+
+/**
+ * Builds the ticket-visibility scope for the current user.
+ * Returns { clause, apply } where:
+ *   clause → SQL fragment to append to a WHERE (starts with ' AND ...' or '')
+ *   apply  → fn(request) that binds the scope params onto an mssql request
+ * Reads branch/department/id from the DB (authoritative), so stale token values
+ * never cause a mismatch. Only hits the DB for roles that actually need scoping.
+ */
+/**
+ * Builds the ticket-visibility scope for the current user.
+ * Resolves role (via role_id → roles.name), branch, department, and id from the
+ * DB in one query, so a stale token role/branch can never cause wrong scoping.
+ */
+async function buildTicketScope(pool, reqUser) {
+    let id = null, branch = null, department = null;
+    let roleName = reqUser.role || null;
+
+    if (reqUser.email) {
+        const r = await pool.request()
+            .input('email', sql.NVarChar, reqUser.email)
+            .query(`
+                SELECT u.id, u.branch, u.department, r.name AS role_name
+                FROM Users u
+                LEFT JOIN roles r ON u.role_id = r.id
+                WHERE u.email = @email
+            `);
+        const me = r.recordset[0];
+        if (me) {
+            id = me.id ?? null;
+            branch = me.branch ?? null;
+            department = me.department ?? null;
+            roleName = me.role_name || roleName;   // authoritative role name from role_id
+        }
+    }
+
+    const strategy = TICKET_SCOPE_STRATEGY[roleName] || 'own';
+
+    // 'all' roles → no restriction
+    if (strategy === 'all') {
+        return { clause: '', apply: (req) => req, roleName, strategy, scopeBranch: branch };
+    }
+
+    const ownClause = '(t.reported_by_id = @scopeUserId OR t.assigned_to_id = @scopeUserId)';
+    const binds = [{ name: 'scopeUserId', type: sql.Int, value: id }];
+    let clause = ` AND ${ownClause}`;
+
+    if (strategy === 'branch' && branch) {
+        binds.push({ name: 'scopeBranch', type: sql.NVarChar, value: branch });
+        clause = ` AND (LTRIM(RTRIM(t.branch)) = LTRIM(RTRIM(@scopeBranch)) OR ${ownClause})`;
+    } else if (strategy === 'department' && department) {
+        binds.push({ name: 'scopeDept', type: sql.NVarChar, value: department });
+        clause = ` AND (LTRIM(RTRIM(t.department)) = LTRIM(RTRIM(@scopeDept)) OR ${ownClause})`;
+    }
+
+    const apply = (request) => {
+        for (const b of binds) request.input(b.name, b.type, b.value);
+        return request;
+    };
+
+    return { clause, apply, roleName, strategy, scopeUserId: id, scopeBranch: branch, scopeDept: department };
+}
+
+
+// ============================================
+// GET PAGINATED TICKETS
+// ============================================
 exports.getPaginatedTickets = async (req, res) => {
     try {
         const pool = await poolPromise;
@@ -132,11 +266,26 @@ exports.getPaginatedTickets = async (req, res) => {
         const dateFilter = req.query.dateFilter || 'all';
         const sortBy = req.query.sortBy || 'date';
 
+        const risk = req.query.risk || '';
+        const system = req.query.system || '';
+        const department = req.query.department || '';
+        const branch = req.query.branch || '';
+
         console.log('📊 Fetching tickets with filters:', { page, pageSize, status, search, dateFilter, sortBy });
 
-        // Build WHERE clause
         let whereClause = 'WHERE 1=1';
         const params = {};
+
+        // ── ROLE-BASED SCOPING (shared helper) ──
+        const scope = await buildTicketScope(pool, req.user);
+        whereClause += scope.clause;
+        console.log('🔐 Ticket scope:', { role: scope.roleName, strategy: scope.strategy, branch: scope.scopeBranch });
+
+        // ── Advanced filters ──
+        if (risk) { whereClause += ' AND t.risk_label = @risk'; params.risk = risk; }
+        if (system) { whereClause += ' AND t.system_name = @system'; params.system = system; }
+        if (department) { whereClause += ' AND t.department = @department'; params.department = department; }
+        if (branch) { whereClause += ' AND t.branch = @branch'; params.branch = branch; }
 
         // Status filter
         if (status !== 'all') {
@@ -144,7 +293,7 @@ exports.getPaginatedTickets = async (req, res) => {
             params.status = status;
         }
 
-        // Search filter - UPDATED to use ID-based joins
+        // Search filter
         if (search) {
             whereClause += ` AND (
                 t.system_name LIKE @search OR 
@@ -160,55 +309,30 @@ exports.getPaginatedTickets = async (req, res) => {
         // Date filter
         if (dateFilter !== 'all') {
             const dateRange = getDateRangeForFilter(dateFilter);
-            console.log('🔍 DATE FILTER DEBUG:');
-            console.log('  - Filter type:', dateFilter);
-            console.log('  - Start date:', dateRange.startDate);
-            console.log('  - End date:', dateRange.endDate);
-
             if (dateRange.startDate && dateRange.endDate) {
                 whereClause += ' AND t.date >= @startDate AND t.date <= @endDate';
                 params.startDate = dateRange.startDate;
                 params.endDate = dateRange.endDate;
-                console.log('  - WHERE clause added with date range');
             }
         }
 
         // Build ORDER BY
-        let orderBy = '';
-        switch (sortBy) {
-            case 'date':
-                orderBy = 'ORDER BY t.created_at DESC';
-                break;
-            case 'status':
-                orderBy = 'ORDER BY t.status';
-                break;
-            case 'risk':
-                orderBy = `ORDER BY 
-                    CASE t.risk_label 
-                        WHEN 'HIGH' THEN 3 
-                        WHEN 'MEDIUM' THEN 2 
-                        WHEN 'LOW' THEN 1 
-                        ELSE 0 
-                    END DESC`;
-                break;
-            default:
-                orderBy = 'ORDER BY t.created_at DESC';
+        let orderBy = 'ORDER BY t.created_at DESC';
+        if (sortBy === 'status') orderBy = 'ORDER BY t.status';
+        else if (sortBy === 'risk') {
+            orderBy = `ORDER BY CASE t.risk_label WHEN 'HIGH' THEN 3 WHEN 'MEDIUM' THEN 2 WHEN 'LOW' THEN 1 ELSE 0 END DESC`;
         }
 
-        // Get total count - UPDATED to use ID-based joins
+        // Bind a (non-scope) param onto a request with the correct type
+        const bindParam = (request, key, value) => {
+            if (key === 'startDate' || key === 'endDate') request.input(key, sql.Date, value);
+            else request.input(key, sql.NVarChar, value);
+        };
+
+        // Count
         const countRequest = pool.request();
-        if (params.status) {
-            countRequest.input('status', sql.NVarChar, params.status);
-        }
-        if (params.search) {
-            countRequest.input('search', sql.NVarChar, params.search);
-        }
-        if (params.startDate) {
-            countRequest.input('startDate', sql.Date, params.startDate);
-        }
-        if (params.endDate) {
-            countRequest.input('endDate', sql.Date, params.endDate);
-        }
+        for (const [key, value] of Object.entries(params)) bindParam(countRequest, key, value);
+        scope.apply(countRequest);
 
         const countResult = await countRequest.query(`
             SELECT COUNT(*) as total
@@ -217,18 +341,12 @@ exports.getPaginatedTickets = async (req, res) => {
             LEFT JOIN Users assigned_user ON t.assigned_to_id = assigned_user.id
             ${whereClause}
         `);
-
         const totalCount = countResult.recordset[0].total;
 
-        // Get paginated data - UPDATED to use ID-based joins
+        // Data
         const dataRequest = pool.request();
-        for (const [key, value] of Object.entries(params)) {
-            if (key === 'startDate' || key === 'endDate') {
-                dataRequest.input(key, sql.Date, value);
-            } else {
-                dataRequest.input(key, sql.NVarChar, value);
-            }
-        }
+        for (const [key, value] of Object.entries(params)) bindParam(dataRequest, key, value);
+        scope.apply(dataRequest);
         dataRequest.input('offset', sql.Int, offset);
         dataRequest.input('pageSize', sql.Int, pageSize);
 
@@ -237,8 +355,8 @@ exports.getPaginatedTickets = async (req, res) => {
                 t.*, 
                 COALESCE(u.name, t.reporter_name) as reportedByName,
                 COALESCE(assigned_user.name, t.assigned_to_name) as assignedToName,
-                u.email as reported_by_email,
-                assigned_user.email as assigned_to_email
+                u.id as reported_by_id,
+                assigned_user.id as assigned_to_id
             FROM Tickets t
             LEFT JOIN Users u ON t.reported_by_id = u.id
             LEFT JOIN Users assigned_user ON t.assigned_to_id = assigned_user.id
@@ -277,85 +395,179 @@ exports.getDashboardStats = async (req, res) => {
 
         console.log('📊 Fetching dashboard stats with filter:', dateFilter);
 
-        // Build WHERE clause using same date logic
-        let whereClause = 'WHERE 1=1';
-        const params = {};
+        // ── ROLE-BASED SCOPING (shared helper) ──
+        const scope = await buildTicketScope(pool, req.user);
+        const scopeClause = scope.clause;
+        const bindScope = scope.apply;
+        console.log('🔐 Stats scope:', { role: scope.roleName, strategy: scope.strategy, branch: scope.scopeBranch });
 
-        // Date filter - Using same logic as frontend
-        if (dateFilter !== 'all') {
-            const dateRange = getDateRangeForFilter(dateFilter);
-            console.log('🔍 Date range:', dateRange);
+        const getComparisonLabel = (filter) => {
+            switch (filter) {
+                case 'today': return 'vs yesterday';
+                case 'yesterday': return 'vs day before';
+                case 'week': return 'vs last week';
+                case 'month': return 'vs last month';
+                case 'quarter': return 'vs last quarter';
+                case 'year': return 'vs last year';
+                default: return '';
+            }
+        };
 
-            if (dateRange.startDate && dateRange.endDate) {
+        const fetchStatsForRange = async (startDate, endDate) => {
+            if (!startDate || !endDate) {
+                return { total_tickets: 0, open_count: 0, in_progress_count: 0, resolved_count: 0 };
+            }
+            const request = pool.request();
+            request.input('startDate', sql.Date, startDate);
+            request.input('endDate', sql.Date, endDate);
+            bindScope(request);
+            const result = await request.query(`
+                SELECT 
+                    COUNT(*) as total_tickets,
+                    SUM(CASE WHEN t.status = 'open' THEN 1 ELSE 0 END) as open_count,
+                    SUM(CASE WHEN t.status = 'in-progress' THEN 1 ELSE 0 END) as in_progress_count,
+                    SUM(CASE WHEN t.status = 'resolved' THEN 1 ELSE 0 END) as resolved_count
+                FROM Tickets t
+                WHERE t.date >= @startDate AND t.date <= @endDate
+                ${scopeClause}
+            `);
+            return result.recordset[0] || { total_tickets: 0, open_count: 0, in_progress_count: 0, resolved_count: 0 };
+        };
+
+        const fetchDetailedStats = async (startDate, endDate) => {
+            const request = pool.request();
+            let whereClause = 'WHERE 1=1';
+            if (startDate && endDate) {
+                request.input('startDate', sql.Date, startDate);
+                request.input('endDate', sql.Date, endDate);
                 whereClause += ' AND t.date >= @startDate AND t.date <= @endDate';
-                params.startDate = dateRange.startDate;
-                params.endDate = dateRange.endDate;
-                console.log('✅ WHERE clause added with date range');
-                console.log('✅ Params:', params);
+            }
+            whereClause += scopeClause;
+            bindScope(request);
+            const result = await request.query(`
+                SELECT 
+                    COUNT(*) as total_tickets,
+                    SUM(CASE WHEN t.status = 'open' THEN 1 ELSE 0 END) as open_count,
+                    SUM(CASE WHEN t.status = 'in-progress' THEN 1 ELSE 0 END) as in_progress_count,
+                    SUM(CASE WHEN t.status = 'resolved' THEN 1 ELSE 0 END) as resolved_count,
+                    SUM(CASE WHEN t.status != 'resolved' THEN 1 ELSE 0 END) as active_tickets,
+                    SUM(CASE WHEN t.status != 'resolved' AND t.risk_label = 'HIGH' THEN 1 ELSE 0 END) as high_risk_count,
+                    SUM(CASE WHEN t.status != 'resolved' AND t.risk_label = 'MEDIUM' THEN 1 ELSE 0 END) as medium_risk_count,
+                    SUM(CASE WHEN t.status != 'resolved' AND t.risk_label = 'LOW' THEN 1 ELSE 0 END) as low_risk_count
+                FROM Tickets t
+                ${whereClause}
+            `);
+            return result.recordset[0];
+        };
+
+        // SLA for current month (scoped)
+        const fetchSla = async () => {
+            const now = new Date();
+            const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+            monthStart.setHours(0, 0, 0, 0);
+            const monthEnd = new Date(now.getFullYear(), now.getMonth() + 1, 0);
+            monthEnd.setHours(23, 59, 59, 999);
+
+            const slaRequest = pool.request();
+            slaRequest.input('monthStart', sql.DateTime, monthStart);
+            slaRequest.input('monthEnd', sql.DateTime, monthEnd);
+            bindScope(slaRequest);
+
+            const slaResult = await slaRequest.query(`
+                SELECT 
+                    COUNT(*) as total_resolved,
+                    SUM(CASE WHEN DATEDIFF(MINUTE, t.created_at, t.updated_at) <= 240 THEN 1 ELSE 0 END) as sla_met
+                FROM Tickets t
+                WHERE t.status = 'resolved'
+                    AND t.updated_at >= @monthStart AND t.updated_at <= @monthEnd
+                    ${scopeClause}
+            `);
+
+            const slaData = slaResult.recordset[0] || {};
+            const slaTotal = slaData.total_resolved || 0;
+            const slaMet = slaData.sla_met || 0;
+            return {
+                percentage: slaTotal > 0 ? Number(((slaMet / slaTotal) * 100).toFixed(1)) : 0,
+                met: slaMet,
+                total: slaTotal,
+                breaches: slaTotal - slaMet
+            };
+        };
+
+        const buildCharts = (s) => ({
+            statusChartData: [
+                { name: "Open", value: s.open_count || 0, color: "#ef4444" },
+                { name: "In Progress", value: s.in_progress_count || 0, color: "#eab308" },
+                { name: "Resolved", value: s.resolved_count || 0, color: "#22c55e" }
+            ].filter(i => i.value > 0),
+            riskChartData: [
+                { name: "Low Risk", value: s.low_risk_count || 0, color: "#3b82f6" },
+                { name: "Medium Risk", value: s.medium_risk_count || 0, color: "#f97316" },
+                { name: "High Risk", value: s.high_risk_count || 0, color: "#ef4444" }
+            ].filter(i => i.value > 0)
+        });
+
+        // ── MAIN LOGIC ──
+        let comparisons = { total: null, open: null, progress: null, resolved: null };
+        let currentStats, statusChartData = [], riskChartData = [];
+
+        if (dateFilter === 'all') {
+            currentStats = await fetchDetailedStats(null, null);
+            ({ statusChartData, riskChartData } = buildCharts(currentStats));
+        } else {
+            const dateRange = getDateRangeForFilter(dateFilter);
+            if (dateRange.startDate && dateRange.endDate) {
+                currentStats = await fetchDetailedStats(dateRange.startDate, dateRange.endDate);
+                ({ statusChartData, riskChartData } = buildCharts(currentStats));
+
+                // previous period for comparison
+                const startObj = new Date(dateRange.startDate);
+                const endObj = new Date(dateRange.endDate);
+                const durationDays = Math.ceil((endObj - startObj) / (1000 * 60 * 60 * 24));
+                const prevEnd = new Date(startObj); prevEnd.setDate(prevEnd.getDate() - 1);
+                const prevStart = new Date(prevEnd); prevStart.setDate(prevEnd.getDate() - durationDays + 1);
+
+                const previousStats = await fetchStatsForRange(
+                    prevStart.toISOString().split('T')[0],
+                    prevEnd.toISOString().split('T')[0]
+                );
+
+                const label = getComparisonLabel(dateFilter);
+                const buildComparison = (cur = 0, prev = 0) => {
+                    if (prev === 0 && cur === 0) return { value: 0, percentage: null, isIncrease: false, label, display: 'No change' };
+                    if (prev === 0 && cur > 0) return { value: cur, percentage: 100, isIncrease: true, label, display: `↑ 100% ${label}` };
+                    const diff = cur - prev;
+                    const pct = Number(((Math.abs(diff) / prev) * 100).toFixed(1));
+                    return { value: Math.abs(diff), percentage: pct, isIncrease: diff >= 0, label, display: `${diff >= 0 ? '↑' : '↓'} ${pct}% ${label}` };
+                };
+
+                comparisons = {
+                    total: buildComparison(currentStats.total_tickets, previousStats.total_tickets),
+                    open: buildComparison(currentStats.open_count, previousStats.open_count),
+                    progress: buildComparison(currentStats.in_progress_count, previousStats.in_progress_count),
+                    resolved: buildComparison(currentStats.resolved_count, previousStats.resolved_count)
+                };
+            } else {
+                currentStats = await fetchDetailedStats(null, null);
+                ({ statusChartData, riskChartData } = buildCharts(currentStats));
             }
         }
 
-        // Create request and add parameters
-        const statsRequest = pool.request();
-
-        // ✅ IMPORTANT: Add parameters to the request
-        if (params.startDate) {
-            statsRequest.input('startDate', sql.Date, params.startDate);
-        }
-        if (params.endDate) {
-            statsRequest.input('endDate', sql.Date, params.endDate);
-        }
-
-        console.log('📝 Final WHERE clause:', whereClause);
-
-        const result = await statsRequest.query(`
-            SELECT 
-                COUNT(*) as total_tickets,
-                SUM(CASE WHEN t.status = 'open' THEN 1 ELSE 0 END) as open_count,
-                SUM(CASE WHEN t.status = 'in-progress' THEN 1 ELSE 0 END) as in_progress_count,
-                SUM(CASE WHEN t.status = 'resolved' THEN 1 ELSE 0 END) as resolved_count,
-                SUM(CASE WHEN t.status != 'resolved' THEN 1 ELSE 0 END) as active_tickets,
-                SUM(CASE WHEN t.status != 'resolved' AND t.risk_label = 'HIGH' THEN 1 ELSE 0 END) as high_risk_count,
-                SUM(CASE WHEN t.status != 'resolved' AND t.risk_label = 'MEDIUM' THEN 1 ELSE 0 END) as medium_risk_count,
-                SUM(CASE WHEN t.status != 'resolved' AND t.risk_label = 'LOW' THEN 1 ELSE 0 END) as low_risk_count
-            FROM Tickets t
-            ${whereClause}
-        `);
-
-        const stats = result.recordset[0];
-
-        console.log('📊 Stats result:', {
-            total: stats.total_tickets,
-            open: stats.open_count,
-            inProgress: stats.in_progress_count,
-            resolved: stats.resolved_count,
-            dateFilter: dateFilter
-        });
-
-        // Prepare chart data
-        const statusChartData = [
-            { name: "Open", value: stats.open_count || 0, color: "#ef4444" },
-            { name: "In Progress", value: stats.in_progress_count || 0, color: "#eab308" },
-            { name: "Resolved", value: stats.resolved_count || 0, color: "#22c55e" }
-        ].filter(item => item.value > 0);
-
-        const riskChartData = [
-            { name: "Low Risk", value: stats.low_risk_count || 0, color: "#3b82f6" },
-            { name: "Medium Risk", value: stats.medium_risk_count || 0, color: "#f97316" },
-            { name: "High Risk", value: stats.high_risk_count || 0, color: "#ef4444" }
-        ].filter(item => item.value > 0);
+        const slaAchievement = await fetchSla();
 
         res.json({
             stats: {
-                total: stats.total_tickets || 0,
-                open: stats.open_count || 0,
-                progress: stats.in_progress_count || 0,
-                resolved: stats.resolved_count || 0,
-                activeTotal: stats.active_tickets || 0,
-                highRisk: stats.high_risk_count || 0,
-                mediumRisk: stats.medium_risk_count || 0,
-                lowRisk: stats.low_risk_count || 0
+                total: currentStats?.total_tickets || 0,
+                open: currentStats?.open_count || 0,
+                progress: currentStats?.in_progress_count || 0,
+                resolved: currentStats?.resolved_count || 0,
+                activeTotal: currentStats?.active_tickets || 0,
+                highRisk: currentStats?.high_risk_count || 0,
+                mediumRisk: currentStats?.medium_risk_count || 0,
+                lowRisk: currentStats?.low_risk_count || 0
             },
+            comparisons,
+            slaAchievement,
             statusChartData,
             riskChartData
         });
@@ -518,8 +730,8 @@ const getStatusActionDescription = (oldStatus, newStatus) => {
     if (newStatus === 'resolved') {
         return { action: 'resolved', text: 'resolved the ticket' };
     }
-    return { 
-        action: `changed status from ${oldStatus} to ${newStatus}`, 
+    return {
+        action: `changed status from ${oldStatus} to ${newStatus}`,
         text: `changed status from ${oldStatus} to ${newStatus}`
     };
 };
@@ -548,25 +760,25 @@ const getReadableFieldName = (field) => {
 // Updated logTicketAction with human-readable formatting
 async function logTicketAction(actionType, entityId, oldData, newData, req, customData = null) {
     const ip_address = getClientIp(req);
-    
+
     // Create human-readable change description
     let humanReadableChanges = {};
     let changeSummary = '';
     let fullDescription = '';
-    
+
     if (customData && customData.changes && Object.keys(customData.changes).length > 0) {
         const changeDescriptions = [];
-        
+
         for (const [key, change] of Object.entries(customData.changes)) {
             // Format old and new values
             const oldVal = formatValueForAudit(change.old);
             const newVal = formatValueForAudit(change.new);
-            
+
             humanReadableChanges[key] = {
                 old: oldVal,
                 new: newVal
             };
-            
+
             // Create a human-readable sentence for this change
             if (key === 'status' && change.action) {
                 changeDescriptions.push(change.action);
@@ -582,7 +794,7 @@ async function logTicketAction(actionType, entityId, oldData, newData, req, cust
                 changeDescriptions.push(`${key.toLowerCase()} changed from "${oldVal}" to "${newVal}"`);
             }
         }
-        
+
         changeSummary = changeDescriptions.join(', ');
         fullDescription = `${req.user.name} ${actionType.toLowerCase()}d ticket ${entityId}: ${changeSummary}`;
     } else if (actionType === 'CREATE') {
@@ -592,11 +804,11 @@ async function logTicketAction(actionType, entityId, oldData, newData, req, cust
         fullDescription = `${req.user.name} deleted ticket ${entityId}`;
         changeSummary = 'Ticket deleted';
     }
-    
+
     // Format old and new values for the entire object
     let formattedOldValue = null;
     let formattedNewValue = null;
-    
+
     if (oldData) {
         const formattedOld = {};
         for (const [key, value] of Object.entries(oldData)) {
@@ -604,7 +816,7 @@ async function logTicketAction(actionType, entityId, oldData, newData, req, cust
         }
         formattedOldValue = JSON.stringify(formattedOld, null, 2);
     }
-    
+
     if (newData) {
         const formattedNew = {};
         for (const [key, value] of Object.entries(newData)) {
@@ -612,7 +824,7 @@ async function logTicketAction(actionType, entityId, oldData, newData, req, cust
         }
         formattedNewValue = JSON.stringify(formattedNew, null, 2);
     }
-    
+
     // Store everything in the changes field
     const finalChanges = {
         summary: changeSummary,
@@ -622,7 +834,7 @@ async function logTicketAction(actionType, entityId, oldData, newData, req, cust
         user: req.user.name,
         action: actionType
     };
-    
+
     await AuditLog.create({
         action_type: actionType,
         entity_type: 'TICKET',
@@ -804,10 +1016,21 @@ exports.createTicket = async (req, res) => {
         const io = req.app.get('io');
         const connectedUsers = req.app.get('connectedUsers');
 
-        for (const user of allUsers) {
-            if (user.email === reportedByEmail) continue;
-            await saveNotification(user.email, notification, ticket_sl);
-            const socketId = connectedUsers?.get(user.email);
+        // Scoped recipients (resolved by ID — no email column needed)
+        const recipients = await getNotificationRecipients({
+            branch,
+            department,
+            reported_by_id: reporterId,
+            assigned_to_id: assignedToId,        // null if unassigned at creation
+            reported_by_email: reportedByEmail,  // we have these here, so pass them too
+            assigned_to_email: assignedToEmail || null,
+        });
+        console.log(`📢 Notifying ${recipients.length} scoped recipients...`);
+
+        for (const email of recipients) {
+            if (email === reportedByEmail) continue;   // don't notify the creator
+            await saveNotification(email, notification, ticket_sl);
+            const socketId = connectedUsers?.get(email);
             if (socketId && io) {
                 io.to(socketId).emit('notification', {
                     ...notification,
@@ -1100,10 +1323,14 @@ exports.updateTicket = async (req, res) => {
                 message: `${updatedBy} ${action} ticket ${oldTicket.ticket_sl}`
             };
 
-            const usersToNotify = [oldTicket.reported_by_email];
-            if (oldTicket.assigned_to_email && oldTicket.assigned_to_email !== oldTicket.reported_by_email) {
-                usersToNotify.push(oldTicket.assigned_to_email);
-            }
+            const usersToNotify = await getNotificationRecipients({
+                branch: oldTicket.branch,
+                department: oldTicket.department,
+                reported_by_id: oldTicket.reported_by_id,
+                assigned_to_id: oldTicket.assigned_to_id,
+                reported_by_email: oldTicket.reported_by_email,  // from the JOIN alias
+                assigned_to_email: oldTicket.assigned_to_email,
+            });
 
             for (const userEmail of usersToNotify) {
                 if (userEmail && userEmail !== req.user?.email) {
@@ -1116,7 +1343,7 @@ exports.updateTicket = async (req, res) => {
             }
         }
 
-        // Assignment change notification
+        // Assignment change notification → notify BOTH the new assignee and the ticket owner
         if (updates.assigned_to_email && oldTicket.assigned_to_email !== updates.assigned_to_email) {
             const newAssigneeInfo = await getUserEmailById(await getUserIdByEmail(updates.assigned_to_email));
             const assignmentNotification = {
@@ -1125,13 +1352,19 @@ exports.updateTicket = async (req, res) => {
                 message: `${updatedBy} assigned ticket ${oldTicket.ticket_sl} to ${newAssigneeInfo?.name || updates.assigned_to_email}`
             };
 
-            await saveNotification(updates.assigned_to_email, assignmentNotification, oldTicket.ticket_sl);
-            const newAssigneeSocketId = connectedUsers?.get(updates.assigned_to_email);
-            if (newAssigneeSocketId && io) {
-                io.to(newAssigneeSocketId).emit('notification', assignmentNotification);
+            const assignmentRecipients = new Set();
+            if (updates.assigned_to_email) assignmentRecipients.add(updates.assigned_to_email);   // the assignee
+            if (oldTicket.reported_by_email) assignmentRecipients.add(oldTicket.reported_by_email); // the owner
+
+            for (const email of assignmentRecipients) {
+                if (!email || email === req.user?.email) continue;   // skip whoever performed the assignment
+                await saveNotification(email, assignmentNotification, oldTicket.ticket_sl);
+                const socketId = connectedUsers?.get(email);
+                if (socketId && io) {
+                    io.to(socketId).emit('notification', assignmentNotification);
+                }
             }
         }
-
         if (io) {
             io.emit('ticket-updated', {
                 ticket: updatedTicket,
@@ -2029,10 +2262,10 @@ async function emitRealtimeDashboardUpdates(io) {
     }
 }
 
-// You can call this function periodically (every 30 seconds) or on demand
-setInterval(() => {
-    const io = require('../server').io; // You'll need to export io from your server
-    if (io) {
-        emitRealtimeDashboardUpdates(io);
-    }
-}, 30000); // Every 30 seconds
+// // You can call this function periodically (every 30 seconds) or on demand
+// setInterval(() => {
+//     const io = require('../server').io; // You'll need to export io from your server
+//     if (io) {
+//         emitRealtimeDashboardUpdates(io);
+//     }
+// }, 30000); // Every 30 seconds
