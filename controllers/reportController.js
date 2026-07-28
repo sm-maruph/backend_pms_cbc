@@ -133,7 +133,7 @@ exports.getReportData = async (req, res) => {
         
         tickets.forEach(ticket => {
             if (ticket.status === 'resolved' && ticket.created_at && ticket.up_time) {
-                const resolutionHours = (new Date(ticket.up_time) - new Date(ticket.created_at)) / (1000 * 60 * 60);
+                const resolutionHours = (new Date(ticket.up_time) - new Date(ticket.down_time)) / (1000 * 60 * 60);
                 if (resolutionHours > 0) {
                     totalResolutionHours += resolutionHours;
                     resolvedWithTime++;
