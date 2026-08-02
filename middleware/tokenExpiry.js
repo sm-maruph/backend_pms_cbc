@@ -20,6 +20,32 @@ setInterval(() => {
 async function handleTokenExpiry(userId, token) {
     try {
         const pool = await poolPromise;
+
+        await pool.request()
+            .input('id', sql.Int, userId)
+            .query(`
+                UPDATE UserSessions
+                SET logout_at = expires_at,
+                    session_duration_seconds = DATEDIFF(SECOND, login_at, expires_at),
+                    session_status = 'EXPIRED',
+                    end_reason = 'TOKEN_EXPIRED'
+                WHERE user_id = @id
+                  AND logout_at IS NULL
+                  AND expires_at IS NOT NULL
+                  AND expires_at <= GETUTCDATE()
+            `);
+
+        const liveSessionResult = await pool.request()
+            .input('id', sql.Int, userId)
+            .query(`
+                SELECT COUNT(*) AS active_count
+                FROM UserSessions
+                WHERE user_id = @id
+                  AND logout_at IS NULL
+                  AND session_status = 'ACTIVE'
+                  AND expires_at > GETUTCDATE()
+            `);
+        const hasDatabaseSession = Number(liveSessionResult.recordset[0]?.active_count || 0) > 0;
         
         // Check if user has any other active sessions
         let hasOtherActiveSession = false;
@@ -31,7 +57,7 @@ async function handleTokenExpiry(userId, token) {
         }
         
         // Only mark offline if no other active sessions
-        if (!hasOtherActiveSession) {
+        if (!hasOtherActiveSession && !hasDatabaseSession) {
             await pool.request()
                 .input('id', sql.Int, userId)
                 .query(`

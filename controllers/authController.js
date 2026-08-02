@@ -120,12 +120,17 @@ exports.login = async (req, res) => {
             null,
             { email: employee_id, name: employee_id }
         );
+
         return res.status(401).json({ success: false, message: reason });
     }
 
     // STEP 2+: DB lookup, session, JWT, tracking, audit.
     try {
         const pool = await poolPromise;
+        await pool.request().query(`
+            IF COL_LENGTH('Users', 'pc_name') IS NULL
+                ALTER TABLE Users ADD pc_name NVARCHAR(100) NULL;
+        `);
 
         // ✅ UPDATED QUERY: Join with roles table to get proper role name
         const result = await pool.request()
@@ -138,6 +143,7 @@ exports.login = async (req, res) => {
                     u.name, 
                     u.department, 
                     u.branch,
+                    u.pc_name,
                     u.created_at, 
                     u.last_login, 
                     u.total_active_seconds, 
@@ -181,6 +187,7 @@ exports.login = async (req, res) => {
                 name: dbUser.name,
                 department: dbUser.department,
                 branch: dbUser.branch,
+                pc_name: dbUser.pc_name,
                 authMethod: 'active_directory'
             },
             process.env.JWT_SECRET,
@@ -204,27 +211,49 @@ exports.login = async (req, res) => {
                         ip_address VARCHAR(45) NULL,
                         user_agent TEXT NULL,
                         session_duration_seconds INT DEFAULT 0,
+                        expires_at DATETIME NULL,
+                        renewed_at DATETIME NULL,
+                        renewal_count INT NOT NULL DEFAULT 0,
+                        session_status VARCHAR(20) NOT NULL DEFAULT 'ACTIVE',
+                        end_reason VARCHAR(40) NULL,
                         created_at DATETIME DEFAULT GETDATE(),
                         FOREIGN KEY (user_id) REFERENCES Users(id)
                     );
                     CREATE INDEX IX_UserSessions_user_id ON UserSessions(user_id);
                     CREATE INDEX IX_UserSessions_session_token ON UserSessions(session_token);
                 END
+                IF COL_LENGTH('UserSessions', 'expires_at') IS NULL ALTER TABLE UserSessions ADD expires_at DATETIME NULL;
+                IF COL_LENGTH('UserSessions', 'renewed_at') IS NULL ALTER TABLE UserSessions ADD renewed_at DATETIME NULL;
+                IF COL_LENGTH('UserSessions', 'renewal_count') IS NULL ALTER TABLE UserSessions ADD renewal_count INT NOT NULL CONSTRAINT DF_UserSessions_renewal_count DEFAULT 0;
+                IF COL_LENGTH('UserSessions', 'session_status') IS NULL ALTER TABLE UserSessions ADD session_status VARCHAR(20) NOT NULL CONSTRAINT DF_UserSessions_status DEFAULT 'ACTIVE';
+                IF COL_LENGTH('UserSessions', 'end_reason') IS NULL ALTER TABLE UserSessions ADD end_reason VARCHAR(40) NULL;
             `);
         } catch (tableErr) {
             console.log('UserSessions table might already exist or error:', tableErr.message);
         }
 
-        // Insert new session (UTC)
+        // Close any abandoned session before starting a new, independently tracked login.
         try {
+            await pool.request()
+                .input('userId', sql.Int, dbUser.id)
+                .query(`
+                    UPDATE UserSessions
+                    SET logout_at = GETUTCDATE(),
+                        session_duration_seconds = DATEDIFF(SECOND, login_at, GETUTCDATE()),
+                        session_status = 'CLOSED',
+                        end_reason = 'REPLACED_BY_LOGIN'
+                    WHERE user_id = @userId AND logout_at IS NULL
+                `);
             await pool.request()
                 .input('userId', sql.Int, dbUser.id)
                 .input('sessionToken', sql.NVarChar, sessionToken)
                 .input('ipAddress', sql.NVarChar, ip_address)
                 .input('userAgent', sql.NVarChar, req.headers['user-agent'] || 'Unknown')
                 .query(`
-                    INSERT INTO UserSessions (user_id, session_token, login_at, ip_address, user_agent)
-                    VALUES (@userId, @sessionToken, GETUTCDATE(), @ipAddress, @userAgent)
+                    INSERT INTO UserSessions
+                        (user_id, session_token, login_at, expires_at, ip_address, user_agent, session_status)
+                    VALUES
+                        (@userId, @sessionToken, GETUTCDATE(), DATEADD(HOUR, 1, GETUTCDATE()), @ipAddress, @userAgent, 'ACTIVE')
                 `);
             console.log(`✅ Session created for user ${dbUser.id}`);
         } catch (sessionErr) {
@@ -272,6 +301,11 @@ exports.login = async (req, res) => {
         console.log(`✅ LOGIN SUCCESS: ${dbUser.employee_id} (${dbUser.role})`);
 
         // ✅ Determine redirect based on role
+        req.app.get('emitToAll')?.('user-activity-updated', {
+            action: 'login',
+            user_id: dbUser.id
+        });
+
         const isAdminRole = dbUser.role === 'Super Admin' || dbUser.role === 'Admin';
         const redirectTo = isAdminRole ? '/admin' : '/dashboard';
 
@@ -288,6 +322,7 @@ exports.login = async (req, res) => {
                 role_id: dbUser.role_id,
                 department: dbUser.department,
                 branch: dbUser.branch,
+                pc_name: dbUser.pc_name,
                 last_login: dbUser.last_login,
                 login_count: (dbUser.login_count || 0) + 1,
                 total_active_seconds: dbUser.total_active_seconds || 0
@@ -315,14 +350,18 @@ exports.logout = async (req, res) => {
     try {
         const pool = await poolPromise;
         const sessionToken = req.headers['x-session-token'];
+        const logoutReason = String(req.body?.reason || 'LOGOUT').slice(0, 40).toUpperCase();
 
         if (sessionToken) {
             await pool.request()
                 .input('sessionToken', sql.NVarChar, sessionToken)
+                .input('reason', sql.VarChar, logoutReason)
                 .query(`
                     UPDATE UserSessions 
                     SET logout_at = GETUTCDATE(),
-                        session_duration_seconds = DATEDIFF(SECOND, login_at, GETUTCDATE())
+                        session_duration_seconds = DATEDIFF(SECOND, login_at, GETUTCDATE()),
+                        session_status = 'CLOSED',
+                        end_reason = @reason
                     WHERE session_token = @sessionToken AND logout_at IS NULL
                 `);
         }
@@ -357,6 +396,11 @@ exports.logout = async (req, res) => {
                 .input('id', sql.Int, req.user.id)
                 .query(`UPDATE Users SET last_logout = GETUTCDATE(), is_online = 0 WHERE id = @id`);
         }
+
+        req.app.get('emitToAll')?.('user-activity-updated', {
+            action: 'logout',
+            user_id: req.user.id
+        });
 
         await logAction(
             req,
@@ -400,6 +444,93 @@ exports.logout = async (req, res) => {
             success: false,
             message: 'Error during logout'
         });
+    }
+};
+
+// Renew an authenticated session for one additional hour.
+exports.renewSession = async (req, res) => {
+    try {
+        const pool = await poolPromise;
+        const result = await pool.request()
+            .input('userId', sql.Int, req.user.id)
+            .query(`
+                SELECT u.id, u.employee_id, u.email, u.name, u.department, u.branch, u.pc_name,
+                       u.role_id, COALESCE(r.name, 'IT User') AS role
+                FROM Users u
+                LEFT JOIN roles r ON r.id = u.role_id
+                WHERE u.id = @userId
+            `);
+
+        const user = result.recordset[0];
+        if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+        let sessionToken = req.headers['x-session-token'];
+        if (!sessionToken) {
+            const activeSession = await pool.request()
+                .input('userId', sql.Int, user.id)
+                .query(`
+                    SELECT TOP 1 session_token
+                    FROM UserSessions
+                    WHERE user_id = @userId
+                      AND logout_at IS NULL
+                      AND session_status = 'ACTIVE'
+                    ORDER BY login_at DESC
+                `);
+            sessionToken = activeSession.recordset[0]?.session_token;
+        }
+        if (!sessionToken) {
+            return res.status(409).json({ success: false, message: 'No active session was found. Please sign in again.' });
+        }
+
+        const renewedSession = await pool.request()
+            .input('sessionToken', sql.NVarChar, sessionToken)
+            .input('userId', sql.Int, user.id)
+            .query(`
+                UPDATE UserSessions
+                SET expires_at = DATEADD(HOUR, 1, GETUTCDATE()),
+                    renewed_at = GETUTCDATE(),
+                    renewal_count = ISNULL(renewal_count, 0) + 1,
+                    session_status = 'ACTIVE'
+                OUTPUT inserted.id, inserted.login_at, inserted.expires_at, inserted.renewal_count
+                WHERE session_token = @sessionToken
+                  AND user_id = @userId
+                  AND logout_at IS NULL
+                  AND session_status = 'ACTIVE'
+            `);
+        if (!renewedSession.recordset.length) {
+            return res.status(409).json({ success: false, message: 'This session is no longer active' });
+        }
+
+        const token = jwt.sign({
+            id: user.id,
+            employee_id: user.employee_id,
+            email: user.email,
+            role: user.role,
+            role_id: user.role_id,
+            name: user.name,
+            department: user.department,
+            branch: user.branch,
+            pc_name: user.pc_name,
+            authMethod: req.user.authMethod || 'active_directory'
+        }, process.env.JWT_SECRET, { expiresIn: '1h' });
+
+        await logAction(req, 'RENEW', 'SESSION', user.id, null, {
+            renewed_for_minutes: 60,
+            session_id: renewedSession.recordset[0].id,
+            expires_at: renewedSession.recordset[0].expires_at,
+            renewal_count: renewedSession.recordset[0].renewal_count
+        });
+
+        res.json({
+            success: true,
+            message: 'Session renewed for one hour',
+            token,
+            sessionToken,
+            expires_in: 3600,
+            expires_at: renewedSession.recordset[0].expires_at
+        });
+    } catch (error) {
+        console.error('Session renewal failed:', error);
+        res.status(500).json({ success: false, message: 'Could not renew session' });
     }
 };
 

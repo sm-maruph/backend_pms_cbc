@@ -22,8 +22,11 @@ router.put('/admin/roles/:roleId/permissions', auth, superAdminOnly, pc.updateRo
 
 // ── All permissions list ──────────────────────────────────────────────────────
 router.get('/admin/permissions', auth, superAdminOnly, pc.getPermissions);
+router.get('/admin/permissions/dashboard', auth, superAdminOnly, pc.getPermissionDashboard);
 
 // ── Assign role to user ───────────────────────────────────────────────────────
 router.put('/admin/users/:userId/role', auth, superAdminOnly, pc.assignUserRole);
+router.get('/admin/users/:userId/permissions', auth, superAdminOnly, pc.getUserPermissions);
+router.put('/admin/users/:userId/permissions', auth, superAdminOnly, pc.updateUserPermissions);
 
 module.exports = router;

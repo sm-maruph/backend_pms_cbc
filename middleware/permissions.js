@@ -10,6 +10,16 @@ const getPermissions = async (userId) => {
   if (cached && Date.now() - cached.ts < CACHE_TTL) return cached.perms;
 
   const pool = await poolPromise;
+  await pool.request().query(`
+    IF OBJECT_ID('user_permissions', 'U') IS NULL
+    CREATE TABLE user_permissions (
+      user_id INT NOT NULL,
+      permission_id INT NOT NULL,
+      granted_by INT NULL,
+      granted_at DATETIME2 NOT NULL DEFAULT GETUTCDATE(),
+      CONSTRAINT PK_user_permissions PRIMARY KEY (user_id, permission_id)
+    )
+  `);
   const result = await pool.request()
     .input('userId', sql.Int, userId)
     .query(`
@@ -19,6 +29,11 @@ const getPermissions = async (userId) => {
       INNER JOIN role_permissions rp ON r.id = rp.role_id
       INNER JOIN permissions p ON rp.permission_id = p.id
       WHERE u.id = @userId
+      UNION
+      SELECT p.name
+      FROM user_permissions up
+      INNER JOIN permissions p ON p.id = up.permission_id
+      WHERE up.user_id = @userId
     `);
 
   const perms = result.recordset.map(r => r.name);

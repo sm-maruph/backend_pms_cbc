@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const { login, logout } = require('../controllers/authController');
+const { login, logout, renewSession } = require('../controllers/authController');
 const authenticateToken = require('../middleware/auth');
 
 const { validateLogin } = require('../middleware/validation');
@@ -8,6 +8,7 @@ const LDAPService = require('../services/ldapService');
 
 router.post('/login', validateLogin, login);
 router.post('/logout', authenticateToken, logout);
+router.post('/renew', authenticateToken, renewSession);
 
 // Add this to authRoutes.js
 router.post('/ping', authenticateToken, async (req, res) => {

@@ -2,6 +2,7 @@
 const jwt = require('jsonwebtoken');
 const { poolPromise, sql } = require('../config/db');
 const { isSessionExpired } = require('./activityTracker');
+const { handleTokenExpiry } = require('./tokenExpiry');
 
 const authenticateToken = async (req, res, next) => {
     const authHeader = req.header('Authorization');
@@ -78,6 +79,14 @@ const authenticateToken = async (req, res, next) => {
         next();
     } catch (err) {
         if (err.name === 'TokenExpiredError') {
+            const expiredUser = jwt.decode(token);
+            if (expiredUser?.id) {
+                await handleTokenExpiry(expiredUser.id, token);
+                req.app.get('emitToAll')?.('user-activity-updated', {
+                    action: 'token-expired',
+                    user_id: expiredUser.id
+                });
+            }
             return res.status(401).json({ message: 'Token expired. Please login again.', code: 'TOKEN_EXPIRED' });
         }
         console.error('❌ Invalid token:', err.message);

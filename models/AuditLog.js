@@ -329,7 +329,7 @@ class AuditLog {
                     VALUES (
                         @action_type, @entity_type, @entity_id, @old_value, @new_value,
                         @changes, @user_id, @user_email, @user_name, @user_role,
-                        @ip_address, @user_agent, GETDATE()
+                        @ip_address, @user_agent, GETUTCDATE()
                     )
                 `);
             return result;

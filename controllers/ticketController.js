@@ -140,11 +140,23 @@ exports.getMyTickets = async (req, res) => {
     try {
         const pool = await poolPromise;
 
-        // First get user ID
-        const userId = await getUserIdByEmail(userEmail);
+        // Resolve the user's authoritative role and branch for role-based My Tickets scope.
+        const currentUserResult = await pool.request()
+            .input('userEmail', sql.NVarChar, userEmail)
+            .query(`
+                SELECT u.id, u.branch, r.name AS role_name
+                FROM Users u
+                LEFT JOIN roles r ON u.role_id = r.id
+                WHERE u.email = @userEmail
+            `);
+        const currentUser = currentUserResult.recordset[0];
+        if (!currentUser) return res.status(404).json({ message: 'User not found' });
+        const isBranchAdmin = currentUser.role_name === 'Branch Admin';
 
         const result = await pool.request()
-            .input('userId', sql.Int, userId)
+            .input('userId', sql.Int, currentUser.id)
+            .input('userBranch', sql.NVarChar, currentUser.branch || null)
+            .input('isBranchAdmin', sql.Bit, isBranchAdmin ? 1 : 0)
             .query(`
                 SELECT 
                     t.*, 
@@ -155,7 +167,9 @@ exports.getMyTickets = async (req, res) => {
                 FROM Tickets t
                 LEFT JOIN Users u ON t.reported_by_id = u.id
                 LEFT JOIN Users assigned_user ON t.assigned_to_id = assigned_user.id
-                WHERE t.reported_by_id = @userId OR t.assigned_to_id = @userId
+                WHERE t.reported_by_id = @userId
+                   OR t.assigned_to_id = @userId
+                   OR (@isBranchAdmin = 1 AND t.branch = @userBranch)
                 ORDER BY t.created_at DESC
             `);
         res.json(result.recordset);
@@ -869,15 +883,32 @@ exports.createTicket = async (req, res) => {
         assignedToEmail,
         assignedToName,
         pcName,
-        downTime
+        downTime,
+        ticketFor
     } = req.body;
+
+    const canAssignAndSetRisk = ['Super Admin', 'Admin', 'IT User'].includes(req.user.role);
+    const useSignedInProfile = !canAssignAndSetRisk && ticketFor !== 'other';
+    const effectiveAffectedUser = useSignedInProfile
+        ? String(req.user.employee_id || req.user.id)
+        : affectedUser;
+    const effectiveDepartment = useSignedInProfile
+        ? req.user.department
+        : department;
+    const effectiveBranch = useSignedInProfile
+        ? req.user.branch
+        : branch;
+    const effectivePcName = useSignedInProfile
+        ? req.user.pc_name
+        : pcName;
 
     const missingFields = [];
     if (!systemName) missingFields.push('systemName');
     if (!problemDetails) missingFields.push('problemDetails');
-    if (!department) missingFields.push('department');
-    if (!branch) missingFields.push('branch');
-    if (!affectedUser) missingFields.push('affectedUser');
+    if (!effectiveDepartment) missingFields.push('department');
+    if (!effectiveBranch) missingFields.push('branch');
+    if (!effectiveAffectedUser) missingFields.push('affectedUser');
+    if (!effectivePcName || !String(effectivePcName).trim()) missingFields.push('pcName');
 
     if (missingFields.length > 0) {
         console.log("❌ Missing required fields:", missingFields);
@@ -889,6 +920,11 @@ exports.createTicket = async (req, res) => {
 
     const reportedByEmail = req.user.email;
     const reporterName = req.user.name;
+    const effectiveRiskLabel = canAssignAndSetRisk && ['LOW', 'MEDIUM', 'HIGH'].includes(String(riskLabel || '').toUpperCase())
+        ? String(riskLabel).toUpperCase()
+        : 'LOW';
+    const effectiveAssignedToEmail = canAssignAndSetRisk ? (assignedToEmail || null) : null;
+    const effectiveAssignedToName = canAssignAndSetRisk ? (assignedToName || 'Unassigned') : 'Unassigned';
 
     try {
         const pool = await poolPromise;
@@ -901,8 +937,8 @@ exports.createTicket = async (req, res) => {
 
         // Get assignee user ID if provided
         let assignedToId = null;
-        if (assignedToEmail) {
-            assignedToId = await getUserIdByEmail(assignedToEmail);
+        if (effectiveAssignedToEmail) {
+            assignedToId = await getUserIdByEmail(effectiveAssignedToEmail);
         }
 
         // Convert downTime to SQL compatible format
@@ -944,18 +980,18 @@ exports.createTicket = async (req, res) => {
         const ticket_sl = ticketSLResult.recordset[0]?.ticket_sl;
         console.log("✅ Generated ticket_sl:", ticket_sl);
 
-        const finalAssignedToName = assignedToName || 'Unassigned';
+        const finalAssignedToName = effectiveAssignedToName;
 
         // Prepare new ticket data for audit
         const newTicketData = {
             ticket_sl: ticket_sl,
             system_name: systemName,
             problem_details: problemDetails,
-            department: department,
-            branch: branch,
-            risk_label: riskLabel || 'MEDIUM',
-            affected_user: affectedUser,
-            assigned_to_email: assignedToEmail || null,
+            department: effectiveDepartment,
+            branch: effectiveBranch,
+            risk_label: effectiveRiskLabel,
+            affected_user: effectiveAffectedUser,
+            assigned_to_email: effectiveAssignedToEmail,
             assigned_to_name: finalAssignedToName,
             status: 'open',
             reporter_name: reporterName,
@@ -970,13 +1006,13 @@ exports.createTicket = async (req, res) => {
             .input('month', sql.NVarChar, new Date(date || new Date()).toLocaleString('default', { month: 'long' }))
             .input('systemName', sql.NVarChar, systemName)
             .input('problemDetails', sql.NVarChar, problemDetails)
-            .input('department', sql.NVarChar, department)
-            .input('branch', sql.NVarChar, branch)
-            .input('riskLabel', sql.NVarChar, riskLabel || 'MEDIUM')
-            .input('affectedUser', sql.NVarChar, affectedUser)
+            .input('department', sql.NVarChar, effectiveDepartment)
+            .input('branch', sql.NVarChar, effectiveBranch)
+            .input('riskLabel', sql.NVarChar, effectiveRiskLabel)
+            .input('affectedUser', sql.NVarChar, effectiveAffectedUser)
             .input('assignedToId', sql.Int, assignedToId)
             .input('assignedToName', sql.NVarChar, finalAssignedToName)
-            .input('pcName', sql.NVarChar, pcName || null)
+            .input('pcName', sql.NVarChar, effectivePcName)
             .input('downTime', sql.DateTime, formattedDownTime || new Date())
             .input('reportedById', sql.Int, reporterId)
             .input('reporterName', sql.NVarChar, reporterName)
@@ -1007,7 +1043,7 @@ exports.createTicket = async (req, res) => {
         const allUsers = await getAllUsers();
         console.log(`📢 Sending notifications to ${allUsers.length} users...`);
 
-        const riskEmoji = riskLabel === 'HIGH' ? '🔴' : riskLabel === 'MEDIUM' ? '🟡' : '🟢';
+        const riskEmoji = effectiveRiskLabel === 'HIGH' ? '🔴' : effectiveRiskLabel === 'MEDIUM' ? '🟡' : '🟢';
         const notification = {
             type: 'new_ticket',
             title: '📢 New Ticket Created',
@@ -1019,12 +1055,12 @@ exports.createTicket = async (req, res) => {
 
         // Scoped recipients (resolved by ID — no email column needed)
         const recipients = await getNotificationRecipients({
-            branch,
-            department,
+            branch: effectiveBranch,
+            department: effectiveDepartment,
             reported_by_id: reporterId,
             assigned_to_id: assignedToId,        // null if unassigned at creation
             reported_by_email: reportedByEmail,  // we have these here, so pass them too
-            assigned_to_email: assignedToEmail || null,
+            assigned_to_email: effectiveAssignedToEmail,
         });
         console.log(`📢 Notifying ${recipients.length} scoped recipients...`);
 
@@ -1049,7 +1085,7 @@ exports.createTicket = async (req, res) => {
                     systemName: systemName,
                     reporterName: reporterName,
                     status: 'open',
-                    riskLevel: riskLabel,
+                    riskLevel: effectiveRiskLabel,
                     createdAt: new Date()
                 },
                 message: `New ticket ${ticket_sl} created by ${reporterName}`
@@ -1080,7 +1116,7 @@ exports.updateTicket = async (req, res) => {
 
     const allowed = [
         'status', 'assigned_to_name', 'assigned_to_email', 'up_time',
-        'root_cause', 'resolution', 'remarks', 'remarks_by_admin',
+        'root_cause', 'resolution', 'remarks', 'remarks_by_admin', 'special_instruction',
         'risk_label', 'system_name', 'department', 'branch',
         'affected_user', 'pc_name', 'down_time', 'problem_details', 'assigned_to_id'
     ];
@@ -1110,6 +1146,46 @@ exports.updateTicket = async (req, res) => {
 
     if (!oldTicket) {
         return res.status(404).json({ message: 'Ticket not found' });
+    }
+
+    if (
+        oldTicket.status === 'resolved' &&
+        updates.status !== undefined &&
+        updates.status !== 'resolved'
+    ) {
+        return res.status(409).json({ message: 'Resolved tickets cannot be reopened' });
+    }
+
+    if (oldTicket.status === 'resolved') {
+        const oldAssigneeEmail = String(oldTicket.assigned_to_email || '').trim().toLowerCase();
+        const requestedAssigneeEmail = String(updates.assigned_to_email || '').trim().toLowerCase();
+        const emailAssignmentChanged =
+            updates.assigned_to_email !== undefined &&
+            requestedAssigneeEmail !== oldAssigneeEmail;
+        const idAssignmentChanged =
+            updates.assigned_to_id !== undefined &&
+            Number(updates.assigned_to_id || 0) !== Number(oldTicket.assigned_to_id || 0);
+
+        if (emailAssignmentChanged || idAssignmentChanged) {
+            return res.status(409).json({ message: 'Resolved tickets cannot be reassigned' });
+        }
+    }
+
+    const isAdminUser = ['Admin', 'Super Admin'].includes(req.user?.role);
+    const canAddResolutionInstruction = ['IT User', 'Admin', 'Super Admin'].includes(req.user?.role);
+    if (updates.remarks_by_admin !== undefined && !isAdminUser) {
+        return res.status(403).json({ message: 'Only Admin or Super Admin can add admin remarks' });
+    }
+    if (updates.special_instruction !== undefined && !canAddResolutionInstruction) {
+        return res.status(403).json({ message: 'Only IT User, Admin, or Super Admin can add a special instruction' });
+    }
+    if (updates.status === 'resolved') {
+        if (!String(updates.root_cause || '').trim()) {
+            return res.status(400).json({ message: 'Root cause is required to resolve a ticket' });
+        }
+        if (!updates.up_time || Number.isNaN(new Date(updates.up_time).getTime())) {
+            return res.status(400).json({ message: 'A valid up time is required to resolve a ticket' });
+        }
     }
 
     console.log("📋 Old ticket data:", {
@@ -1235,21 +1311,6 @@ exports.updateTicket = async (req, res) => {
         }
     }
 
-    // Handle resolution without up_time
-    if (updates.status === 'resolved' && !updates.up_time) {
-        const now = new Date();
-        request.input('up_time', sql.DateTime, now);
-        setClause.push('up_time = @up_time');
-
-        if (hasChanged(oldTicket.up_time, now)) {
-            changes['Up Time'] = {
-                old: oldTicket.up_time ? new Date(oldTicket.up_time).toLocaleString() : 'Not set',
-                new: now.toLocaleString()
-            };
-            newTicketData.up_time = now;
-        }
-    }
-
     if (setClause.length === 0) {
         return res.status(400).json({ message: 'No valid fields to update' });
     }
@@ -1321,7 +1382,7 @@ exports.updateTicket = async (req, res) => {
             const statusNotification = {
                 type: 'status_change',
                 title: `📝 Ticket Status Changed`,
-                message: `${updatedBy} ${action} ticket ${oldTicket.ticket_sl}`
+                message: `${updatedBy} ${action} ticket ${oldTicket.ticket_sl}${updates.status === 'resolved' && updates.remarks?.trim() ? `. Remarks: ${updates.remarks.trim()}` : ''}${updates.status === 'resolved' && updates.special_instruction?.trim() ? `. Instruction: ${updates.special_instruction.trim()}` : ''}`
             };
 
             const usersToNotify = await getNotificationRecipients({
@@ -1341,6 +1402,32 @@ exports.updateTicket = async (req, res) => {
                         io.to(socketId).emit('notification', statusNotification);
                     }
                 }
+            }
+        }
+
+        // Admin remarks are optional guidance sent to every IT User.
+        if (
+            updates.remarks_by_admin !== undefined &&
+            hasChanged(oldTicket.remarks_by_admin, updates.remarks_by_admin) &&
+            String(updates.remarks_by_admin || '').trim()
+        ) {
+            const adminRemark = String(updates.remarks_by_admin).trim();
+            const itUsersResult = await pool.request().query(`
+                SELECT DISTINCT u.email
+                FROM Users u
+                INNER JOIN roles r ON u.role_id = r.id
+                WHERE r.name IN ('IT User', 'IT Member') AND u.email IS NOT NULL
+            `);
+            const adminRemarkNotification = {
+                type: 'admin_remark',
+                title: 'Admin remark added',
+                message: `${updatedBy} added a remark for ticket ${oldTicket.ticket_sl}: ${adminRemark}`
+            };
+            for (const itUser of itUsersResult.recordset) {
+                if (!itUser.email || itUser.email === req.user?.email) continue;
+                await saveNotification(itUser.email, adminRemarkNotification, oldTicket.ticket_sl);
+                const socketId = connectedUsers?.get(itUser.email);
+                if (socketId && io) io.to(socketId).emit('notification', adminRemarkNotification);
             }
         }
 
@@ -2050,6 +2137,7 @@ exports.getDownAtms = async (req, res) => {
                 t.reporter_name as reported_by_name,
                 t.affected_user,
                 t.pc_name,
+                DATEDIFF(MINUTE, t.down_time, GETUTCDATE()) as downtime_minutes,
                 u.name as assigned_to_name_from_users
             FROM Tickets t
             LEFT JOIN Users u ON t.assigned_to_id = u.id
@@ -2069,12 +2157,9 @@ exports.getDownAtms = async (req, res) => {
             let downTimeDuration = 'Unknown';
             let downtimeHours = 0;
 
-            if (atm.down_time) {
+            if (atm.down_time && Number.isFinite(Number(atm.downtime_minutes))) {
                 try {
-                    const downTime = new Date(atm.down_time);
-                    const now = new Date();
-                    const diffMs = now - downTime;
-                    const diffMins = Math.floor(diffMs / 60000);
+                    const diffMins = Math.max(0, Number(atm.downtime_minutes));
                     const diffHours = Math.floor(diffMins / 60);
                     const diffDays = Math.floor(diffHours / 24);
 
@@ -2157,7 +2242,8 @@ async function emitRealtimeDashboardUpdates(io) {
                 t.status,
                 t.risk_label,
                 t.assigned_to_name,
-                t.reporter_name as reported_by_name
+                t.reporter_name as reported_by_name,
+                DATEDIFF(MINUTE, t.down_time, GETUTCDATE()) as downtime_minutes
             FROM Tickets t
             WHERE t.status IN ('open', 'in-progress')
                 AND (t.system_name LIKE '%ATM%' 
@@ -2171,10 +2257,8 @@ async function emitRealtimeDashboardUpdates(io) {
         // Calculate downtime for ATMs
         const downAtms = downAtmsResult.recordset.map(atm => {
             let downTimeDuration = 'Unknown';
-            if (atm.down_time) {
-                const downTime = new Date(atm.down_time);
-                const now = new Date();
-                const diffMins = Math.floor((now - downTime) / 60000);
+            if (atm.down_time && Number.isFinite(Number(atm.downtime_minutes))) {
+                const diffMins = Math.max(0, Number(atm.downtime_minutes));
                 const diffHours = Math.floor(diffMins / 60);
                 const diffDays = Math.floor(diffHours / 24);
 

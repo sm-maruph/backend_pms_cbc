@@ -7,7 +7,8 @@ const config = {
     database: process.env.DB_NAME,
     options: {
         encrypt: false,               // set to true if using Azure
-        trustServerCertificate: true  // for self-signed certs (dev only)
+        trustServerCertificate: true, // for self-signed certs (dev only)
+        useUTC: true                   // SQL DATETIME values are stored and read as UTC
     }
 };
 
@@ -28,7 +29,5 @@ try {
     console.error('❌ Database Connection Error:', err.message);
     poolPromise = Promise.reject(err);
 }
-
-module.exports = { poolPromise, sql };
 
 module.exports = { sql, poolPromise };
